@@ -96,8 +96,10 @@ class NavController:
         self.goal = None  # Current goal position in world frame [x, y]
         self.initial_pose_variance = 100.0
         self.pose_variance = self.initial_pose_variance
-        self.pose_covariance = np.eye(3, dtype=np.float64) * self.pose_variance
+        self.yaw_variance = self.initial_pose_variance
+        self.pose_covariance = np.diag([self.pose_variance, self.pose_variance, self.yaw_variance])
         self.vo_process_variance = 0.04
+        self.yaw_process_variance = 0.12
         self.vo_imu_blend = 0.65
         self.minimum_tag_confidence = 15.0
 
@@ -112,6 +114,8 @@ class NavController:
         self.last_frame_time = None
         self.latest_yaw_rate = 0.0
         self.latest_velocity_command = np.zeros(3, dtype=np.float64)
+        self.projected_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        self.gravity_filter_gain = 0.20
 
         # Occupancy map: x/y in [-3, 3] m at 5 cm/cell.  Log odds of zero
         # represents unknown space.
@@ -136,6 +140,25 @@ class NavController:
         self.state = "EXPLORE"
         self.path = []
         self.last_update_time = None
+
+    def _roll_pitch_from_gravity(self) -> tuple[float, float]:
+        """Estimate body roll and pitch from the filtered gravity direction."""
+        gravity = self.projected_gravity
+        pitch = np.arcsin(np.clip(gravity[0], -1.0, 1.0))
+        roll = np.arctan2(-gravity[1], -gravity[2])
+        return float(roll), float(pitch)
+
+    def _body_rotation_world(self) -> np.ndarray:
+        """Return the body-to-world rotation using estimated yaw, pitch, and roll."""
+        roll, pitch = self._roll_pitch_from_gravity()
+        yaw = float(self.robot_pose[2])
+        cr, sr = np.cos(roll), np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        rotation_x = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]])
+        rotation_y = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
+        rotation_z = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+        return rotation_z @ rotation_y @ rotation_x
 
     def detect_apriltags(self, rgb_image: torch.Tensor, visualize: bool = False) -> dict[int, dict]:
         """
@@ -390,7 +413,8 @@ class NavController:
         self.robot_pose[:2] += body_to_world @ delta_body
         self.robot_pose[2] = _wrap_angle(previous_yaw + delta_yaw)
         self.pose_variance += self.vo_process_variance * max(dt, 1.0e-3)
-        self.pose_covariance = np.eye(3, dtype=np.float64) * self.pose_variance
+        self.yaw_variance += self.yaw_process_variance * max(dt, 1.0e-3)
+        self.pose_covariance = np.diag([self.pose_variance, self.pose_variance, self.yaw_variance])
 
     @staticmethod
     def _tag_rotation_world(tag_id: int) -> np.ndarray:
@@ -460,13 +484,16 @@ class NavController:
         )
         measured_variance = 1.0 / weight_sum
 
-        alpha = self.pose_variance / (self.pose_variance + measured_variance)
+        position_alpha = self.pose_variance / (self.pose_variance + measured_variance)
+        yaw_alpha = self.yaw_variance / (self.yaw_variance + measured_variance)
         innovation = measured_pose - self.robot_pose
         innovation[2] = _wrap_angle(innovation[2])
-        self.robot_pose += alpha * innovation
+        self.robot_pose[:2] += position_alpha * innovation[:2]
+        self.robot_pose[2] += yaw_alpha * innovation[2]
         self.robot_pose[2] = _wrap_angle(self.robot_pose[2])
-        self.pose_variance *= 1.0 - alpha
-        self.pose_covariance = np.eye(3, dtype=np.float64) * self.pose_variance
+        self.pose_variance *= 1.0 - position_alpha
+        self.yaw_variance *= 1.0 - yaw_alpha
+        self.pose_covariance = np.diag([self.pose_variance, self.pose_variance, self.yaw_variance])
 
         self.detection_buffer.append(
             {
@@ -514,11 +541,14 @@ class NavController:
             return False
 
         fx, fy, cx, cy = self.camera_params
-        cosine = np.cos(self.robot_pose[2])
-        sine = np.sin(self.robot_pose[2])
-        body_to_world = np.array([[cosine, -sine], [sine, cosine]])
-        camera_world_xy = self.robot_pose[:2] + body_to_world @ self.camera_offset_body
-        camera_cell = self._world_to_grid(camera_world_xy)
+        body_rotation_world = self._body_rotation_world()
+        camera_mount_offset = np.array(
+            [self.camera_offset_body[0], self.camera_offset_body[1], 0.0], dtype=np.float64
+        )
+        camera_world = np.array(
+            [self.robot_pose[0], self.robot_pose[1], self.camera_height], dtype=np.float64
+        ) + body_rotation_world @ camera_mount_offset
+        camera_cell = self._world_to_grid(camera_world[:2])
         if camera_cell is None:
             return False
         valid_ray_count = 0
@@ -530,15 +560,14 @@ class NavController:
                     continue
                 camera_x = (u - cx) * distance / fx
                 camera_y = (v - cy) * distance / fy
-                endpoint_height = self.camera_height - camera_y
-                if endpoint_height < self.minimum_obstacle_height or endpoint_height > 1.5:
+                # OpenCV camera axes are x-right, y-down, z-forward.  The
+                # aligned body axes are x-forward, y-left, z-up.
+                point_camera_in_body_axes = np.array([distance, -camera_x, -camera_y], dtype=np.float64)
+                point_world = camera_world + body_rotation_world @ point_camera_in_body_axes
+                if point_world[2] < self.minimum_obstacle_height or point_world[2] > 1.5:
                     continue
 
-                point_body = np.array(
-                    [distance + self.camera_offset_body[0], -camera_x + self.camera_offset_body[1]]
-                )
-                point_world = self.robot_pose[:2] + body_to_world @ point_body
-                hit_cell = self._world_to_grid(point_world)
+                hit_cell = self._world_to_grid(point_world[:2])
                 if hit_cell is None:
                     continue
 
@@ -609,6 +638,18 @@ class NavController:
             if angular_velocity.size >= 3:
                 self.latest_yaw_rate = float(angular_velocity[2])
 
+        projected_gravity = observations.get("projected_gravity")
+        if projected_gravity is not None:
+            measured_gravity = np.asarray(projected_gravity, dtype=np.float64).reshape(-1)
+            if measured_gravity.size >= 3 and np.all(np.isfinite(measured_gravity[:3])):
+                measured_gravity = measured_gravity[:3]
+                gravity_norm = np.linalg.norm(measured_gravity)
+                if gravity_norm > 1.0e-6:
+                    measured_gravity /= gravity_norm
+                    gain = self.gravity_filter_gain
+                    self.projected_gravity = (1.0 - gain) * self.projected_gravity + gain * measured_gravity
+                    self.projected_gravity /= np.linalg.norm(self.projected_gravity)
+
         velocity_command = observations.get("velocity_commands")
         if velocity_command is not None:
             command = np.asarray(velocity_command, dtype=np.float64).reshape(-1)
@@ -668,7 +709,8 @@ class NavController:
         print(
             "[NavController] Estimated pose: "
             f"x={self.robot_pose[0]:.3f} m, y={self.robot_pose[1]:.3f} m, "
-            f"yaw={np.degrees(self.robot_pose[2]):.1f} deg, variance={self.pose_variance:.5f}"
+            f"yaw={np.degrees(self.robot_pose[2]):.1f} deg, "
+            f"xy_var={self.pose_variance:.5f}, yaw_var={self.yaw_variance:.5f}"
         )
 
         real_pose = observations.get('robot_pose', None)
@@ -678,6 +720,8 @@ class NavController:
                 f"x={real_pose[0]:.3f} m, y={real_pose[1]:.3f} m, "
                 f"yaw={np.degrees(real_pose[2]):.1f} deg"
             )
+        else:
+            print("[NavController] Ground truth pose: Not available")
 
     def get_command(self) -> np.ndarray:
         """
@@ -717,13 +761,15 @@ class NavController:
         """
         self.robot_pose = np.zeros(3, dtype=np.float64)
         self.pose_variance = self.initial_pose_variance
-        self.pose_covariance = np.eye(3, dtype=np.float64) * self.pose_variance
+        self.yaw_variance = self.initial_pose_variance
+        self.pose_covariance = np.diag([self.pose_variance, self.pose_variance, self.yaw_variance])
         self.previous_gray = None
         self.previous_depth = None
         self.last_frame_time = None
         self.last_update_time = None
         self.latest_yaw_rate = 0.0
         self.latest_velocity_command.fill(0.0)
+        self.projected_gravity[:] = (0.0, 0.0, -1.0)
         self.occupancy_grid.fill(0.0)
         self.map_update_count = 0
         self.last_map_update_time = None
@@ -739,6 +785,8 @@ class NavController:
             "robot_pose": self.robot_pose.tolist(),
             "pose_covariance": self.pose_covariance.tolist(),
             "pose_variance": self.pose_variance,
+            "yaw_variance": self.yaw_variance,
+            "projected_gravity": self.projected_gravity.tolist(),
             "landmark_count": len(self.landmark_map),
             "landmark_map": self.landmark_map,
             "state": self.state,
