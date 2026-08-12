@@ -126,7 +126,7 @@ class NavController:
         self.max_mapping_distance = 5.0
         self.minimum_obstacle_height = 0.10
         self.map_update_count = 0
-        self.map_update_interval = 2.0
+        self.map_update_interval = 0.1
         self.last_map_update_time = None
         self.map_save_interval = 10
         self.map_save_dir = "navigation_maps"
@@ -670,6 +670,14 @@ class NavController:
             f"x={self.robot_pose[0]:.3f} m, y={self.robot_pose[1]:.3f} m, "
             f"yaw={np.degrees(self.robot_pose[2]):.1f} deg, variance={self.pose_variance:.5f}"
         )
+
+        real_pose = observations.get('robot_pose', None)
+        if real_pose is not None:
+            print(
+                "[NavController] Ground truth pose: "
+                f"x={real_pose[0]:.3f} m, y={real_pose[1]:.3f} m, "
+                f"yaw={np.degrees(real_pose[2]):.1f} deg"
+            )
 
     def get_command(self) -> np.ndarray:
         """
