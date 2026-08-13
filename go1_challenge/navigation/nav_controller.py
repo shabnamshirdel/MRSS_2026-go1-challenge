@@ -135,16 +135,27 @@ class NavController:
         self.minimum_obstacle_height = 0.10
         self.mapping_yaw_rate_limit = 0.15
         self.map_update_count = 0
-        self.map_update_interval = 0.1
-        self.last_map_update_time = None
         self.map_save_interval = 10
         self.map_save_dir = "navigation_maps"
+        self._clear_saved_maps()
 
         self.landmark_map = {tag_id: list(position) for tag_id, position in TAG_POSITIONS.items()}
         self.detection_buffer = []
+        self.has_absolute_pose_fix = False
         self.state = "EXPLORE"
         self.path = []
         self.last_update_time = None
+
+    def _clear_saved_maps(self) -> None:
+        """Remove map snapshots from the previous run once at startup."""
+        try:
+            os.makedirs(self.map_save_dir, exist_ok=True)
+            for filename in os.listdir(self.map_save_dir):
+                is_generated_map = filename.startswith("occupancy_map_") and filename.endswith((".png", ".npy"))
+                if is_generated_map:
+                    os.remove(os.path.join(self.map_save_dir, filename))
+        except OSError as error:
+            print(f"[WARNING] Failed to clear saved occupancy maps: {error}")
 
     def _roll_pitch_from_gravity(self) -> tuple[float, float]:
         """Estimate body roll and pitch from the filtered gravity direction."""
@@ -509,6 +520,10 @@ class NavController:
         )
         measured_variance = 1.0 / weight_sum
 
+        # Do not retain scans made in the arbitrary startup frame.  The first
+        # confident landmark observation establishes the world-map frame.
+        first_absolute_fix = not self.has_absolute_pose_fix
+
         position_alpha = self.pose_variance / (self.pose_variance + measured_variance)
         yaw_alpha = self.yaw_variance / (self.yaw_variance + measured_variance)
         innovation = measured_pose - self.robot_pose
@@ -519,6 +534,10 @@ class NavController:
         self.pose_variance *= 1.0 - position_alpha
         self.yaw_variance *= 1.0 - yaw_alpha
         self.pose_covariance = np.diag([self.pose_variance, self.pose_variance, self.yaw_variance])
+        self.has_absolute_pose_fix = True
+        if first_absolute_fix:
+            self.occupancy_grid.fill(0.0)
+            self.map_update_count = 0
 
         self.detection_buffer.append(
             {
@@ -727,15 +746,12 @@ class NavController:
         detected_tags = self.detect_apriltags(image, visualize=False)
         self._fuse_tag_measurements(detected_tags)
 
-        map_update_due = (
-            self.last_map_update_time is None
-            or wall_timestamp - self.last_map_update_time >= self.map_update_interval
-            or wall_timestamp < self.last_map_update_time
-        )
         robot_is_turning = abs(self.latest_yaw_rate) > self.mapping_yaw_rate_limit
-        should_update_map = depth is not None and map_update_due and not robot_is_turning
-        if should_update_map and self._update_occupancy_grid(depth):
-            self.last_map_update_time = wall_timestamp
+        # Camera frames already arrive at 10 Hz.  Update once per frame rather
+        # than using wall time, because Isaac Sim may run faster than real time.
+        should_update_map = depth is not None and self.has_absolute_pose_fix and not robot_is_turning
+        if should_update_map:
+            self._update_occupancy_grid(depth)
 
         self.previous_gray = gray.copy()
         self.previous_depth = None if depth is None else depth.copy()
@@ -810,9 +826,9 @@ class NavController:
         self.projected_gravity[:] = (0.0, 0.0, -1.0)
         self.occupancy_grid.fill(0.0)
         self.map_update_count = 0
-        self.last_map_update_time = None
         self.landmark_map = {tag_id: list(position) for tag_id, position in TAG_POSITIONS.items()}
         self.detection_buffer.clear()
+        self.has_absolute_pose_fix = False
         self.state = "EXPLORE"
         self.path.clear()
 
@@ -825,6 +841,7 @@ class NavController:
             "pose_variance": self.pose_variance,
             "yaw_variance": self.yaw_variance,
             "projected_gravity": self.projected_gravity.tolist(),
+            "has_absolute_pose_fix": self.has_absolute_pose_fix,
             "landmark_count": len(self.landmark_map),
             "landmark_map": self.landmark_map,
             "state": self.state,
