@@ -50,13 +50,13 @@ env:
           # pyramid_slope_inv:
           #   proportion: 0.1
           flat:
-            proportion: 0.45
+            proportion: 0.70
           pyramid_stairs:
-            proportion: 0.15
+            proportion: 0.0
           pyramid_stairs_inv:
-            proportion: 0.15
+            proportion: 0.0
           boxes:
-            proportion: 0.15
+            proportion: 0.1
           random_rough:
             proportion: 0.1
           pyramid_slope:
@@ -81,9 +81,9 @@ env:
     ang_vel_xy_l2:
       # weight: -0.01  # Penalize angular velocity in x and y directions (helps stability)
       weight: -0.025
-    base_height_l2:
+    base_height_l2: 
       # weight: -5.0  # Penalize squared deviation from the desired terrain-relative trunk height
-      weight: -0.5
+      weight: -0.2
       params:
         target_height: 0.35  # Desired trunk height above the local terrain in meters
     dof_acc_l2:
