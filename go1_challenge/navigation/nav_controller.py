@@ -133,7 +133,6 @@ class NavController:
         self.pixel_stride = 12
         self.max_mapping_distance = 5.0
         self.minimum_obstacle_height = 0.10
-        self.mapping_yaw_rate_limit = 0.15
         self.map_update_count = 0
         self.map_save_interval = 10
         self.map_save_dir = "navigation_maps"
@@ -746,10 +745,9 @@ class NavController:
         detected_tags = self.detect_apriltags(image, visualize=False)
         self._fuse_tag_measurements(detected_tags)
 
-        robot_is_turning = abs(self.latest_yaw_rate) > self.mapping_yaw_rate_limit
         # Camera frames already arrive at 10 Hz.  Update once per frame rather
         # than using wall time, because Isaac Sim may run faster than real time.
-        should_update_map = depth is not None and self.has_absolute_pose_fix and not robot_is_turning
+        should_update_map = depth is not None and self.has_absolute_pose_fix
         if should_update_map:
             self._update_occupancy_grid(depth)
 
