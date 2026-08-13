@@ -100,7 +100,9 @@ class NavController:
         self.pose_covariance = np.diag([self.pose_variance, self.pose_variance, self.yaw_variance])
         self.vo_process_variance = 0.04
         self.yaw_process_variance = 0.12
-        self.vo_imu_blend = 0.65
+        # Yaw from optical flow is sensitive to blur and vibration during a
+        # turn, so let the IMU provide most of the heading increment.
+        self.vo_imu_blend = 0.25
         self.minimum_tag_confidence = 15.0
 
         # The simulated camera is 0.25 m in front of the base and about 0.48 m
@@ -129,6 +131,7 @@ class NavController:
         self.pixel_stride = 12
         self.max_mapping_distance = 5.0
         self.minimum_obstacle_height = 0.10
+        self.mapping_yaw_rate_limit = 0.15
         self.map_update_count = 0
         self.map_update_interval = 0.1
         self.last_map_update_time = None
@@ -390,6 +393,26 @@ class NavController:
         delta_forward = float(camera_delta[2])
         delta_left = float(-camera_delta[0])
 
+        # VO measures motion at the camera, not at the robot center.  Because
+        # the camera is mounted in front of the base, an in-place turn makes it
+        # travel along an arc.  Remove that lever-arm motion before integrating
+        # the translation as base motion.
+        camera_offset_forward, camera_offset_left = self.camera_offset_body
+        cosine_delta = np.cos(delta_yaw)
+        sine_delta = np.sin(delta_yaw)
+        rotation_translation_forward = (
+            cosine_delta * camera_offset_forward
+            - sine_delta * camera_offset_left
+            - camera_offset_forward
+        )
+        rotation_translation_left = (
+            sine_delta * camera_offset_forward
+            + cosine_delta * camera_offset_left
+            - camera_offset_left
+        )
+        delta_forward -= rotation_translation_forward
+        delta_left -= rotation_translation_left
+
         # Reject catastrophic feature matches instead of corrupting the filter.
         maximum_translation = max(0.35, 3.0 * dt)
         if np.hypot(delta_forward, delta_left) > maximum_translation or abs(delta_yaw) > 0.8:
@@ -632,6 +655,10 @@ class NavController:
         """
         # Proprioception and camera data arrive in separate calls.  Cache the
         # latest IMU/command values without integrating twice.
+        
+        print("[NavController] observations keys:", list(observations.keys()))
+        # print("[NavController] observations:", observations)
+
         base_ang_vel = observations.get("base_ang_vel")
         if base_ang_vel is not None:
             angular_velocity = np.asarray(base_ang_vel, dtype=np.float64).reshape(-1)
@@ -698,7 +725,9 @@ class NavController:
             or timestamp - self.last_map_update_time >= self.map_update_interval
             or timestamp < self.last_map_update_time
         )
-        if depth is not None and map_update_due and self._update_occupancy_grid(depth):
+        robot_is_turning = abs(self.latest_yaw_rate) > self.mapping_yaw_rate_limit
+        should_update_map = depth is not None and map_update_due and not robot_is_turning
+        if should_update_map and self._update_occupancy_grid(depth):
             self.last_map_update_time = timestamp
 
         self.previous_gray = gray.copy()
