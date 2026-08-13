@@ -1,7 +1,7 @@
 task: MRSS-Velocity-Go1-v0  # Name of the task.
 
 headless: true  # Run simulation without rendering a GUI (faster, better for training on servers)
-max_iterations: 2500  # Adjust this to train for longer: 1.5k should give you a working policy for rough terrain
+max_iterations: 1500  # Adjust this to train for longer: 1.5k should give you a working policy for rough terrain
 penalize_target_height: true # Set false to remove the base-height deviation penalty during training
 randomize_actuator_response: false # Randomize motor strength by +/-10% and response smoothing by 0-10%
 
@@ -11,7 +11,8 @@ video: false  # Record videos during training.
 video_length: 10  # Length of the recorded video (in steps).
 video_interval: 10  # Interval between video recordings (in steps).
 
-run_name: uneven_suggestions_gpt  # Run name suffix to the log directory.
+run_name: uneven_new_rewards  # Run name suffix to the log directory.
+experiment_name: go1_locomotion_height_training  # Folder under logs/rsl_rl used for checkpoints.
 resume: false  # Whether to resume from a checkpoint.
 #load_run: LOAD_RUN   # Name of the run folder to resume from.
 #checkpoint: CHECKPOINT  # Checkpoint file to resume from.
@@ -50,7 +51,7 @@ env:
           # pyramid_slope_inv:
           #   proportion: 0.1
           flat:
-            proportion: 0.70
+            proportion: 0.80
           pyramid_stairs:
             proportion: 0.0
           pyramid_stairs_inv:
@@ -80,12 +81,12 @@ env:
       weight: -0.01  # Penalty for rapid changes in actions (encourages smoothness)
     ang_vel_xy_l2:
       # weight: -0.01  # Penalize angular velocity in x and y directions (helps stability)
-      weight: -0.025
+      weight: -0.035
     base_height_l2: 
       # weight: -5.0  # Penalize squared deviation from the desired terrain-relative trunk height
-      weight: -0.2
+      weight: -50.0
       params:
-        target_height: 0.35  # Desired trunk height above the local terrain in meters
+        target_height: 0.3  # Desired trunk height above the local terrain in meters
     dof_acc_l2:
       # weight: -2.5e-06  # Penalty for joint accelerations (encourages smoother motion)
       weight: -5.0e-07
@@ -99,7 +100,7 @@ env:
     feet_air_time:
       # weight: 0.01  # Reward for time feet spend in the air (encourages stepping/gait)
       # weight: 0.125
-      weight: 0.20
+      weight: 0.8
     flat_orientation_l2:
       # weight: 0.0  # Penalty for orientation deviation from flat (disabled here)
       # weight: 0.01
@@ -107,9 +108,9 @@ env:
     lin_vel_z_l2:
       # weight: -2.0  # Penalty for vertical (z-axis) linear velocity (encourages flat motion)
       # weight: -1.0
-      weight: -0.75
+      weight: -2.0
     track_ang_vel_z_exp:
-      weight: 2.0  # Reward for matching desired angular velocity around z-axis (yaw control)
+      weight: 3.0  # Reward for matching desired angular velocity around z-axis (yaw control)
     track_lin_vel_xy_exp:
       # weight: 1.5  # Reward for matching desired linear velocity in x-y plane
       weight: 3.5

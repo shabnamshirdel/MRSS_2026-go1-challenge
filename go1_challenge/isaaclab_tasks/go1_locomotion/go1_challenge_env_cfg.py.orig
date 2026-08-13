@@ -50,7 +50,7 @@ from go1_challenge.isaaclab_tasks.go1_locomotion.go1_locomotion_env_cfg import G
 ARENA_ASSETS_DIR = Path(__file__).parent.parent.parent / "arena_assets"
 
 # Level-3 terrain caps. The configured 2.5 m pyramid has four elevation changes.
-ARENA_MAX_TERRAIN_HEIGHT = 0.05
+ARENA_MAX_TERRAIN_HEIGHT = 0.10
 ARENA_PYRAMID_ELEVATION_CHANGES = 4
 
 

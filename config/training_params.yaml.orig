@@ -1,7 +1,7 @@
 task: MRSS-Velocity-Go1-v0  # Name of the task.
 
 headless: true  # Run simulation without rendering a GUI (faster, better for training on servers)
-max_iterations: 700  # Adjust this to train for longer: 1.5k should give you a working policy for rough terrain
+max_iterations: 500  # Adjust this to train for longer: 1.5k should give you a working policy for rough terrain
 penalize_target_height: true  # Enable terrain-relative trunk-height penalization
 randomize_actuator_response: false  # Randomize motor strength and response delay when enabled
 
@@ -11,8 +11,7 @@ video: false  # Record videos during training.
 video_length: 10  # Length of the recorded video (in steps).
 video_interval: 10  # Interval between video recordings (in steps).
 
-run_name: flat_terrain  # Run name suffix to the log directory.
-experiment_name: go1_locomotion_height_training  # Folder under logs/rsl_rl used for checkpoints.
+run_name: go1_locomotion  # Run name suffix to the log directory.
 resume: false  # Whether to resume from a checkpoint.
 #load_run: LOAD_RUN   # Name of the run folder to resume from.
 #checkpoint: CHECKPOINT  # Checkpoint file to resume from.
@@ -20,7 +19,7 @@ logger: wandb  # Logger module to use. {neptune, wandb, tensorboard}
 log_project_name: MRSS26  # Name of the logging project when using wandb or neptune.
 env:
   scene:
-    num_envs: 1024  # Number of environments to generate terrain for and run in parallel.
+    num_envs: 1  # Number of environments to generate terrain for and run in parallel.
 
     terrain:
       max_init_terrain_level: 5  # Maximum initial difficulty level of terrains for curriculum learning
@@ -70,42 +69,25 @@ env:
     
   rewards:
     action_rate_l2:
-      weight: -0.01  # Penalty for rapid changes in actions (encourages smoothness)
+      weight: -0.1  # Penalty for rapid changes in actions (encourages smoothness)
     ang_vel_xy_l2:
-      # weight: -0.01  # Penalize angular velocity in x and y directions (helps stability)
-      weight: -0.025
-    base_height_l2: 
-      # weight: -5.0  # Penalize squared deviation from the desired terrain-relative trunk height
-      weight: -50.0
-      params:
-        target_height: 0.3  # Desired trunk height above the local terrain in meters
+      weight: -0.05  # Penalty for angular velocity in x and y directions (helps stability)
     dof_acc_l2:
-      # weight: -2.5e-06  # Penalty for joint accelerations (encourages smoother motion)
-      weight: -5.0e-07
+      weight: -2.5e-07  # Penalty for joint accelerations (encourages smoother motion)
     dof_pos_limits:
-      # weight: 0.1  # Penalty for exceeding joint limits (disabled here)
-      weight: 0.0
+      weight: 0.0  # Penalty for exceeding joint limits (disabled here)
     dof_torques_l2:
-      # weight: -0.0002  # Penalty for large joint torques (encourages energy efficiency)
-      # weight: -0.001
-      weight: -0.0002
+      weight: -0.0002  # Penalty for large joint torques (encourages energy efficiency)
     feet_air_time:
-      # weight: 0.01  # Reward for time feet spend in the air (encourages stepping/gait)
-      # weight: 0.125
-      weight: 0.7
+      weight: 0.01  # Reward for time feet spend in the air (encourages stepping/gait)
     flat_orientation_l2:
-      # weight: 0.0  # Penalty for orientation deviation from flat (disabled here)
-      # weight: 0.01
-      weight: -0.05
+      weight: 0.0  # Penalty for orientation deviation from flat (disabled here)
     lin_vel_z_l2:
-      # weight: -2.0  # Penalty for vertical (z-axis) linear velocity (encourages flat motion)
-      # weight: -1.0
-      weight: -2.0
+      weight: -2.0  # Penalty for vertical (z-axis) linear velocity (encourages flat motion)
     track_ang_vel_z_exp:
-      weight: 2.0  # Reward for matching desired angular velocity around z-axis (yaw control)
+      weight: 0.75  # Reward for matching desired angular velocity around z-axis (yaw control)
     track_lin_vel_xy_exp:
-      # weight: 1.5  # Reward for matching desired linear velocity in x-y plane
-      weight: 3.5
+      weight: 1.5  # Reward for matching desired linear velocity in x-y plane
 
   events:
     add_base_mass:
@@ -117,7 +99,7 @@ env:
         force_range: [ 0.0, 0.0 ]  # Range for randomizing the external force applied to the base
         torque_range: [ 0.0, 0.0 ]  # Range for randomizing the external torque applied to the base
 
-    # push_robot: null  # Event to push the robot, set to None to disable
+    push_robot: null  # Event to push the robot, set to None to disable
 
 
 algorithm:

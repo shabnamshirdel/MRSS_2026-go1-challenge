@@ -14,48 +14,12 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
-from isaaclab.assets import RigidObject
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.sensors import ContactSensor, RayCaster
+from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
-
-
-def finite_base_height_l2(
-    env: ManagerBasedRLEnv,
-    target_height: float,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
-    max_height_error: float = 1.0,
-) -> torch.Tensor:
-    """Penalize terrain-relative base height while ignoring missed ray hits."""
-    asset: RigidObject = env.scene[asset_cfg.name]
-    sensor: RayCaster = env.scene[sensor_cfg.name]
-
-    root_height = asset.data.root_pos_w.torch[:, 2]
-    ray_heights = sensor.data.ray_hits_w.torch[..., 2]
-    finite_hits = torch.isfinite(ray_heights)
-    hit_count = finite_hits.sum(dim=1)
-    safe_hits = torch.where(finite_hits, ray_heights, 0.0)
-    terrain_height = safe_hits.sum(dim=1) / hit_count.clamp_min(1)
-    terrain_relative_height = root_height - terrain_height
-
-    # Keep the unweighted physical measurement available to the training logger.
-    # NaN marks environments for which the scanner did not hit any terrain so
-    # those samples can be excluded from the reported average.
-    env._last_base_height_above_terrain = torch.where(
-        hit_count > 0,
-        terrain_relative_height,
-        torch.full_like(terrain_relative_height, torch.nan),
-    ).detach()
-    env._base_height_target = target_height
-
-    height_error = terrain_relative_height - target_height
-    height_error = torch.where(hit_count > 0, height_error, torch.zeros_like(height_error))
-    height_error = torch.nan_to_num(height_error, nan=0.0).clamp(-max_height_error, max_height_error)
-    return torch.square(height_error)
 
 
 def feet_air_time(

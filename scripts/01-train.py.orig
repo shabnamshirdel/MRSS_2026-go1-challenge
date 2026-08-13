@@ -63,8 +63,7 @@ if args_cli.config:
 
     # Pre-populate args_cli attributes if they are defined in config and not passed on CLI
     cli_keys = ["task", "seed", "max_iterations", "video", "video_length", "video_interval",
-                "resume", "load_run", "checkpoint", "run_name", "experiment_name", "logger",
-                "log_project_name"]
+                "resume", "load_run", "checkpoint", "run_name", "logger", "log_project_name"]
     for key in cli_keys:
         if key in config_params and getattr(args_cli, key) is None:
             setattr(args_cli, key, config_params[key])
@@ -192,49 +191,6 @@ def enable_best_success_checkpoint(runner: OnPolicyRunner, log_dir: str) -> None
     runner.logger.log = log_and_save_best
 
 
-def enable_base_height_metrics(runner: OnPolicyRunner) -> None:
-    """Log physical terrain-relative base height statistics for each rollout."""
-    height_sum = 0.0
-    abs_error_sum = 0.0
-    sample_count = 0
-    original_process_env_step = runner.logger.process_env_step
-    original_log = runner.logger.log
-
-    def process_env_step_and_height(*args, **kwargs):
-        nonlocal height_sum, abs_error_sum, sample_count
-
-        height = getattr(runner.env.unwrapped, "_last_base_height_above_terrain", None)
-        target = getattr(runner.env.unwrapped, "_base_height_target", None)
-        if height is not None and target is not None:
-            valid_height = height[torch.isfinite(height)]
-            if valid_height.numel() > 0:
-                height_sum += valid_height.sum().item()
-                abs_error_sum += torch.abs(valid_height - target).sum().item()
-                sample_count += valid_height.numel()
-
-        original_process_env_step(*args, **kwargs)
-
-    def log_with_height(**kwargs):
-        nonlocal height_sum, abs_error_sum, sample_count
-
-        original_log(**kwargs)
-        if sample_count > 0 and runner.logger.writer is not None:
-            iteration = kwargs["it"]
-            runner.logger.writer.add_scalar(
-                "Metrics/mean_base_height_above_terrain_m", height_sum / sample_count, iteration
-            )
-            runner.logger.writer.add_scalar(
-                "Metrics/mean_abs_base_height_error_m", abs_error_sum / sample_count, iteration
-            )
-
-        height_sum = 0.0
-        abs_error_sum = 0.0
-        sample_count = 0
-
-    runner.logger.process_env_step = process_env_step_and_height
-    runner.logger.log = log_with_height
-
-
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Train with RSL-RL agent."""
@@ -340,10 +296,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-
-    if isinstance(runner, OnPolicyRunner):
-        enable_best_success_checkpoint(runner, log_dir)
-        enable_base_height_metrics(runner)
 
     runner.add_git_repo_to_log(__file__)
 
