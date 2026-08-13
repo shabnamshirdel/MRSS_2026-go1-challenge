@@ -114,6 +114,8 @@ class NavController:
         self.previous_gray = None
         self.previous_depth = None
         self.last_frame_time = None
+        self.last_sensor_timestamp = None
+        self.camera_frame_dt = 0.1  # Camera observations are produced at 10 Hz in the simulator.
         self.latest_yaw_rate = 0.0
         self.latest_velocity_command = np.zeros(3, dtype=np.float64)
         self.projected_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float64)
@@ -701,11 +703,16 @@ class NavController:
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
         depth = None if distance_image is None else np.asarray(distance_image).squeeze()
 
-        timestamp = float(observations.get("timestamp", time.monotonic()))
-        if self.last_frame_time is None:
+        wall_timestamp = time.monotonic()
+        sensor_timestamp = observations.get("timestamp")
+        if self.previous_gray is None:
             dt = 0.0
+        elif sensor_timestamp is not None and self.last_sensor_timestamp is not None:
+            dt = float(np.clip(float(sensor_timestamp) - self.last_sensor_timestamp, 1.0e-3, 0.5))
         else:
-            dt = float(np.clip(timestamp - self.last_frame_time, 1.0e-3, 0.5))
+            # Isaac Sim may execute faster or slower than real time.  Therefore,
+            # wall-clock time cannot be used to integrate simulated IMU rates.
+            dt = self.camera_frame_dt
 
         delta_body = np.zeros(2, dtype=np.float64)
         delta_yaw_vo = 0.0
@@ -722,18 +729,19 @@ class NavController:
 
         map_update_due = (
             self.last_map_update_time is None
-            or timestamp - self.last_map_update_time >= self.map_update_interval
-            or timestamp < self.last_map_update_time
+            or wall_timestamp - self.last_map_update_time >= self.map_update_interval
+            or wall_timestamp < self.last_map_update_time
         )
         robot_is_turning = abs(self.latest_yaw_rate) > self.mapping_yaw_rate_limit
         should_update_map = depth is not None and map_update_due and not robot_is_turning
         if should_update_map and self._update_occupancy_grid(depth):
-            self.last_map_update_time = timestamp
+            self.last_map_update_time = wall_timestamp
 
         self.previous_gray = gray.copy()
         self.previous_depth = None if depth is None else depth.copy()
-        self.last_frame_time = timestamp
-        self.last_update_time = timestamp
+        self.last_frame_time = wall_timestamp
+        self.last_sensor_timestamp = None if sensor_timestamp is None else float(sensor_timestamp)
+        self.last_update_time = wall_timestamp
 
         print(
             "[NavController] Estimated pose: "
@@ -795,6 +803,7 @@ class NavController:
         self.previous_gray = None
         self.previous_depth = None
         self.last_frame_time = None
+        self.last_sensor_timestamp = None
         self.last_update_time = None
         self.latest_yaw_rate = 0.0
         self.latest_velocity_command.fill(0.0)
