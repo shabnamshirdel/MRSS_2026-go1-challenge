@@ -85,7 +85,7 @@ env:
       # weight: -5.0  # Penalize squared deviation from the desired terrain-relative trunk height
       weight: -0.5
       params:
-        target_height: 0.4  # Desired trunk height above the local terrain in meters
+        target_height: 0.35  # Desired trunk height above the local terrain in meters
     dof_acc_l2:
       # weight: -2.5e-06  # Penalty for joint accelerations (encourages smoother motion)
       weight: -5.0e-07
