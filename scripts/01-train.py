@@ -144,12 +144,78 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+def enable_best_success_checkpoint(runner: OnPolicyRunner, log_dir: str) -> None:
+    """Save ``model_best.pt`` whenever the mean episode success rate improves.
+
+    RSL-RL clears its episode-metric buffer at the end of ``Logger.log``. Wrapping
+    that method lets us read the same success-rate samples that are sent to the
+    configured logger without changing the rollout or optimization loop.
+    """
+    metric_name = "Metrics/success_rate"
+    best_success_rate = float("-inf")
+    original_log = runner.logger.log
+
+    def log_and_save_best(**kwargs):
+        nonlocal best_success_rate
+
+        metric_values = []
+        for episode_metrics in runner.logger.ep_extras:
+            if metric_name in episode_metrics:
+                value = torch.as_tensor(episode_metrics[metric_name]).detach().float().reshape(-1)
+                metric_values.append(value)
+
+        current_success_rate = None
+        if metric_values:
+            current_success_rate = torch.cat(metric_values).mean().item()
+
+        # Preserve normal RSL-RL logging, including clearing ep_extras.
+        original_log(**kwargs)
+
+        if current_success_rate is not None and current_success_rate > best_success_rate:
+            best_success_rate = current_success_rate
+            iteration = kwargs["it"]
+            best_path = os.path.join(log_dir, "model_best.pt")
+            runner.save(
+                best_path,
+                infos={
+                    "best_metric": metric_name,
+                    "best_metric_value": best_success_rate,
+                    "best_iteration": iteration,
+                },
+            )
+            print(
+                f"[INFO]: Saved new best checkpoint to {best_path} "
+                f"({metric_name}={best_success_rate:.4f}, iteration={iteration})"
+            )
+
+    runner.logger.log = log_and_save_best
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Train with RSL-RL agent."""
 
     if "env" in config_params:
         env_cfg.from_dict(config_params["env"])
+
+    penalize_target_height = config_params.get("penalize_target_height", True)
+    if not isinstance(penalize_target_height, bool):
+        raise TypeError("'penalize_target_height' must be either true or false in the training config.")
+    if not penalize_target_height:
+        if not hasattr(env_cfg, "rewards") or not hasattr(env_cfg.rewards, "base_height_l2"):
+            raise ValueError(
+                "The selected task does not define the 'base_height_l2' reward required by "
+                "'penalize_target_height'."
+            )
+        env_cfg.rewards.base_height_l2 = None
+
+    randomize_actuator_response = config_params.get("randomize_actuator_response", False)
+    if not isinstance(randomize_actuator_response, bool):
+        raise TypeError("'randomize_actuator_response' must be either true or false in the training config.")
+    if randomize_actuator_response:
+        env_cfg.scene.robot.actuators["base_legs"].motor_strength_range = (0.9, 1.1)
+        env_cfg.actions.joint_pos.min_delay_fraction = 0.0
+        env_cfg.actions.joint_pos.max_delay_fraction = 0.1
 
     if "algorithm" in config_params and hasattr(agent_cfg, "algorithm"):
         agent_cfg.algorithm.from_dict(config_params["algorithm"])
@@ -231,6 +297,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
 
+    if isinstance(runner, OnPolicyRunner):
+        enable_best_success_checkpoint(runner, log_dir)
+
     runner.add_git_repo_to_log(__file__)
 
     # load the checkpoint
@@ -255,4 +324,3 @@ if __name__ == "__main__":
     main()
     # close sim app
     simulation_app.close()
-

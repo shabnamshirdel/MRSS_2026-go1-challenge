@@ -1,0 +1,146 @@
+task: MRSS-Velocity-Go1-v0  # Name of the task.
+
+headless: true  # Run simulation without rendering a GUI (faster, better for training on servers)
+max_iterations: 2500  # Adjust this to train for longer: 1.5k should give you a working policy for rough terrain
+penalize_target_height: true # Set false to remove the base-height deviation penalty during training
+randomize_actuator_response: false # Randomize motor strength by +/-10% and response smoothing by 0-10%
+
+seed: 69 # Performance should be somewhat consistent across seeds
+
+video: false  # Record videos during training.
+video_length: 10  # Length of the recorded video (in steps).
+video_interval: 10  # Interval between video recordings (in steps).
+
+run_name: uneven_suggestions_gpt  # Run name suffix to the log directory.
+resume: false  # Whether to resume from a checkpoint.
+#load_run: LOAD_RUN   # Name of the run folder to resume from.
+#checkpoint: CHECKPOINT  # Checkpoint file to resume from.
+logger: wandb  # Logger module to use. {neptune, wandb, tensorboard}
+log_project_name: MRSS26  # Name of the logging project when using wandb or neptune.
+env:
+  scene:
+    num_envs: 2048 #Number of environments to generate terrain for and run in parallel.
+
+    terrain:
+      max_init_terrain_level: 5  # Maximum initial difficulty level of terrains for curriculum learning
+
+      terrain_generator: 
+        # Each column is assigned a random terrain type from the sub_terrains.
+        num_cols: 20  # Number of terrain columns (patches) in the scene. Default is 20.
+        num_rows: 10  # Number of terrain rows (patches) in the scene. Default is 10.
+        
+        # The difficulty linearly increases along the rows if curriculum is enabled.
+        curriculum: True  # Enable terrain difficulty progression over time
+        
+        # You can change the proportions of the different terrains
+        # See the different possible terrains here https://isaac-sim.github.io/IsaacLab/main/source/api/lab/isaaclab.terrains.html#terrain-generator
+        sub_terrains:
+          # flat:
+          #   proportion: 0.2
+          # pyramid_stairs:
+          #   proportion: 0.15
+          # pyramid_stairs_inv:
+          #   proportion: 0.15
+          # boxes:
+          #   proportion: 0.15
+          # random_rough:
+          #   proportion: 0.15
+          # pyramid_slope:
+          #   proportion: 0.1
+          # pyramid_slope_inv:
+          #   proportion: 0.1
+          flat:
+            proportion: 0.45
+          pyramid_stairs:
+            proportion: 0.15
+          pyramid_stairs_inv:
+            proportion: 0.15
+          boxes:
+            proportion: 0.15
+          random_rough:
+            proportion: 0.1
+          pyramid_slope:
+            proportion: 0.0
+          pyramid_slope_inv:
+            proportion: 0.0
+        
+      # # terrain_generator: 
+      # #   sub_terrains: 'null'
+      #   border_height: 1.0  # Height of border around the terrain patch
+      #   border_width: 20.0  # Width of border around the terrain patch
+      #   difficulty_range: [ 0.0, 1.0 ]  # Range of terrain difficulties to sample from
+      #   horizontal_scale: 0.1  # Horizontal scaling factor for terrain features
+      #   size: [ 8.0, 8.0 ]  # Size of each terrain patch (meters)
+      #   slope_threshold: 0.75  # Max slope allowed for terrain generation
+      #   use_cache: False  # Use cached terrains or regenerate every time
+      #   vertical_scale: 0.005  # Vertical scaling factor for heightmap features
+    
+  rewards:
+    action_rate_l2:
+      weight: -0.01  # Penalty for rapid changes in actions (encourages smoothness)
+    ang_vel_xy_l2:
+      # weight: -0.01  # Penalize angular velocity in x and y directions (helps stability)
+      weight: -0.025
+    base_height_l2:
+      # weight: -5.0  # Penalize squared deviation from the desired terrain-relative trunk height
+      weight: -0.5
+      params:
+        target_height: 0.4  # Desired trunk height above the local terrain in meters
+    dof_acc_l2:
+      # weight: -2.5e-06  # Penalty for joint accelerations (encourages smoother motion)
+      weight: -5.0e-07
+    dof_pos_limits:
+      # weight: 0.1  # Penalty for exceeding joint limits (disabled here)
+      weight: 0.0
+    dof_torques_l2:
+      # weight: -0.0002  # Penalty for large joint torques (encourages energy efficiency)
+      # weight: -0.001
+      weight: -0.0002
+    feet_air_time:
+      # weight: 0.01  # Reward for time feet spend in the air (encourages stepping/gait)
+      # weight: 0.125
+      weight: 0.20
+    flat_orientation_l2:
+      # weight: 0.0  # Penalty for orientation deviation from flat (disabled here)
+      # weight: 0.01
+      weight: -0.05
+    lin_vel_z_l2:
+      # weight: -2.0  # Penalty for vertical (z-axis) linear velocity (encourages flat motion)
+      # weight: -1.0
+      weight: -0.75
+    track_ang_vel_z_exp:
+      weight: 2.0  # Reward for matching desired angular velocity around z-axis (yaw control)
+    track_lin_vel_xy_exp:
+      # weight: 1.5  # Reward for matching desired linear velocity in x-y plane
+      weight: 3.5
+
+  events:
+    add_base_mass:
+      params:
+        mass_distribution_params: [ -1.0, 3.0 ]  # Range for randomizing the base mass
+
+    base_external_force_torque:
+      params:
+        force_range: [ 0.0, 0.0 ]  # Range for randomizing the external force applied to the base
+        torque_range: [ 0.0, 0.0 ]  # Range for randomizing the external torque applied to the base
+
+    # push_robot: null  # Event to push the robot, set to None to disable
+
+
+algorithm:
+  class_name: 'PPO'  # Name of the RL algorithm to use (Proximal Policy Optimization)
+  clip_param: 0.2  # Clipping parameter for PPO objective
+  desired_kl: 0.01  # Target KL divergence between old and new policies
+  entropy_coef: 0.01  # Coefficient for entropy bonus (encourages exploration)
+  gamma: 0.99  # Discount factor for future rewards
+  lam: 0.95  # GAE lambda parameter for bias-variance tradeoff
+  learning_rate: 0.001  # Initial learning rate for optimizer
+  max_grad_norm: 1.0  # Maximum gradient norm for clipping
+  normalize_advantage_per_mini_batch: False  # Whether to normalize advantages per mini-batch
+  num_learning_epochs: 5  # Number of passes over data per training iteration
+  num_mini_batches: 4  # Number of mini-batches per epoch
+  rnd_cfg: null  # Configuration for Random Network Distillation (not used here)
+  schedule: 'adaptive'  # Learning rate schedule type (adaptive vs fixed)
+  symmetry_cfg: null  # Optional symmetry loss configuration (not used here)
+  use_clipped_value_loss: True  # Use value function clipping in PPO
+  value_loss_coef: 1.0  # Coefficient for value function loss
