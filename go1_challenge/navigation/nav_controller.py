@@ -133,10 +133,37 @@ class NavController:
         self.pixel_stride = 12
         self.max_mapping_distance = 5.0
         self.minimum_obstacle_height = 0.10
+        self.enable_occupancy_mapping = False
         self.map_update_count = 0
         self.map_save_interval = 10
         self.map_save_dir = "navigation_maps"
         self._clear_saved_maps()
+
+        # Reactive navigation parameters.  The arena walls are known exactly;
+        # the depth camera is used only for temporary obstacles inside it.
+        self.arena_half_extent = 2.4
+        self.goal_tolerance = 0.25
+        self.goal_attraction_gain = 1.0
+        self.wall_influence_distance = 0.60
+        self.wall_repulsion_gain = 1.5
+        self.obstacle_influence_distance = 0.90
+        self.obstacle_detection_range = 1.50
+        self.obstacle_repulsion_gain = 1.8
+        self.front_blocking_half_width = 0.32
+        self.front_blocking_distance = 0.75
+        self.front_release_distance = 0.95
+        self.emergency_distance = 0.32
+        self.maximum_translation_speed = 0.55
+        self.maximum_yaw_speed = 0.45
+        self.yaw_command_gain = 0.65
+        self.navigation_pixel_stride = 10
+        self.obstacle_sector_count = 31
+        self.local_obstacle_repulsion = np.zeros(2, dtype=np.float64)
+        self.nearest_front_obstacle = np.inf
+        self.left_clearance = self.obstacle_detection_range
+        self.right_clearance = self.obstacle_detection_range
+        self.avoid_side = 0  # +1 is left, -1 is right.
+        self.avoid_clear_frames = 0
 
         self.landmark_map = {tag_id: list(position) for tag_id, position in TAG_POSITIONS.items()}
         self.detection_buffer = []
@@ -644,6 +671,126 @@ class NavController:
         except (OSError, ValueError, cv2.error) as error:
             print(f"[WARNING] Failed to save occupancy map: {error}")
 
+    def _update_local_obstacles(self, distance_image: np.ndarray) -> None:
+        """Build a bounded local repulsive force from one nearest hit per sector."""
+        depth = np.asarray(distance_image).squeeze()
+        self.local_obstacle_repulsion.fill(0.0)
+        self.nearest_front_obstacle = np.inf
+        self.left_clearance = self.obstacle_detection_range
+        self.right_clearance = self.obstacle_detection_range
+        if depth.ndim != 2:
+            return
+
+        fx, fy, cx, cy = self.camera_params
+        body_rotation_world = self._body_rotation_world()
+        camera_mount_offset = np.array(
+            [self.camera_offset_body[0], self.camera_offset_body[1], 0.0], dtype=np.float64
+        )
+        camera_world = np.array(
+            [self.robot_pose[0], self.robot_pose[1], self.camera_height], dtype=np.float64
+        ) + body_rotation_world @ camera_mount_offset
+        cosine = np.cos(self.robot_pose[2])
+        sine = np.sin(self.robot_pose[2])
+        world_to_planar_body = np.array([[cosine, sine], [-sine, cosine]], dtype=np.float64)
+
+        sector_distances = np.full(self.obstacle_sector_count, np.inf, dtype=np.float64)
+        sector_points = np.zeros((self.obstacle_sector_count, 2), dtype=np.float64)
+        half_fov = np.arctan2(depth.shape[1] * 0.5, fx)
+
+        for v in range(0, depth.shape[0], self.navigation_pixel_stride):
+            for u in range(0, depth.shape[1], self.navigation_pixel_stride):
+                distance = float(depth[v, u])
+                if not np.isfinite(distance) or not 0.10 < distance < self.obstacle_detection_range:
+                    continue
+
+                camera_x = (u - cx) * distance / fx
+                camera_y = (v - cy) * distance / fy
+                point_camera_in_body_axes = np.array([distance, -camera_x, -camera_y], dtype=np.float64)
+                point_world = camera_world + body_rotation_world @ point_camera_in_body_axes
+                if point_world[2] < self.minimum_obstacle_height or point_world[2] > 1.20:
+                    continue
+
+                point_body = world_to_planar_body @ (point_world[:2] - self.robot_pose[:2])
+                planar_distance = float(np.linalg.norm(point_body))
+                if planar_distance <= 0.10 or point_body[0] < -0.05:
+                    continue
+
+                bearing = float(np.arctan2(point_body[1], point_body[0]))
+                normalized_bearing = np.clip((bearing + half_fov) / (2.0 * half_fov), 0.0, 1.0)
+                sector = min(int(normalized_bearing * self.obstacle_sector_count), self.obstacle_sector_count - 1)
+                if planar_distance < sector_distances[sector]:
+                    sector_distances[sector] = planar_distance
+                    sector_points[sector] = point_body
+
+        repulsion = np.zeros(2, dtype=np.float64)
+        active_sector_count = 0
+        left_samples = []
+        right_samples = []
+        center_angle = np.arctan2(self.front_blocking_half_width, self.front_blocking_distance)
+        for distance, point_body in zip(sector_distances, sector_points):
+            if not np.isfinite(distance):
+                continue
+            bearing = float(np.arctan2(point_body[1], point_body[0]))
+            if bearing >= center_angle:
+                left_samples.append(distance)
+            elif bearing <= -center_angle:
+                right_samples.append(distance)
+
+            if point_body[0] > 0.0 and abs(point_body[1]) < self.front_blocking_half_width:
+                self.nearest_front_obstacle = min(self.nearest_front_obstacle, distance)
+
+            if distance < self.obstacle_influence_distance:
+                strength = (self.obstacle_influence_distance - distance) / self.obstacle_influence_distance
+                repulsion -= strength * point_body / distance
+                active_sector_count += 1
+
+        if active_sector_count:
+            repulsion *= self.obstacle_repulsion_gain / active_sector_count
+        self.local_obstacle_repulsion = repulsion
+        if left_samples:
+            self.left_clearance = float(np.mean(left_samples))
+        if right_samples:
+            self.right_clearance = float(np.mean(right_samples))
+
+        front_blocked = self.nearest_front_obstacle < self.front_blocking_distance
+        if front_blocked:
+            self.avoid_clear_frames = 0
+            if self.avoid_side == 0:
+                self.avoid_side = 1 if self.left_clearance >= self.right_clearance else -1
+            self.state = "AVOID_LEFT" if self.avoid_side > 0 else "AVOID_RIGHT"
+        elif self.avoid_side:
+            if self.nearest_front_obstacle > self.front_release_distance:
+                self.avoid_clear_frames += 1
+            else:
+                self.avoid_clear_frames = 0
+            if self.avoid_clear_frames >= 4:
+                self.avoid_side = 0
+                self.avoid_clear_frames = 0
+                self.state = "GO_TO_GOAL"
+
+    def _wall_repulsion_body(self) -> np.ndarray:
+        """Return repulsion from the four known arena walls in the body frame."""
+        x, y = self.robot_pose[:2]
+        extent = self.arena_half_extent
+        influence = self.wall_influence_distance
+        repulsion_world = np.zeros(2, dtype=np.float64)
+
+        wall_distances = (
+            (x + extent, np.array([1.0, 0.0])),
+            (extent - x, np.array([-1.0, 0.0])),
+            (y + extent, np.array([0.0, 1.0])),
+            (extent - y, np.array([0.0, -1.0])),
+        )
+        for distance, away_direction in wall_distances:
+            if distance < influence:
+                normalized_strength = np.clip((influence - distance) / influence, 0.0, 1.5)
+                repulsion_world += self.wall_repulsion_gain * normalized_strength * away_direction
+
+        cosine = np.cos(self.robot_pose[2])
+        sine = np.sin(self.robot_pose[2])
+        world_to_body = np.array([[cosine, sine], [-sine, cosine]], dtype=np.float64)
+        return world_to_body @ repulsion_world
+
     def update(self, observations: dict[str, Any]) -> None:
         """
         Update internal navigation state based on sensor observations.
@@ -745,9 +892,14 @@ class NavController:
         detected_tags = self.detect_apriltags(image, visualize=False)
         self._fuse_tag_measurements(detected_tags)
 
+        if depth is not None:
+            self._update_local_obstacles(depth)
+
         # Camera frames already arrive at 10 Hz.  Update once per frame rather
         # than using wall time, because Isaac Sim may run faster than real time.
-        should_update_map = depth is not None and self.has_absolute_pose_fix
+        should_update_map = (
+            self.enable_occupancy_mapping and depth is not None and self.has_absolute_pose_fix
+        )
         if should_update_map:
             self._update_occupancy_grid(depth)
 
@@ -764,15 +916,6 @@ class NavController:
             f"xy_var={self.pose_variance:.5f}, yaw_var={self.yaw_variance:.5f}"
         )
 
-        real_pose = observations.get('robot_pose', None)
-        if real_pose is not None:
-            print(
-                "[NavController] Ground truth pose: "
-                f"x={real_pose[0]:.3f} m, y={real_pose[1]:.3f} m, "
-                f"yaw={np.degrees(real_pose[2]):.1f} deg"
-            )
-        else:
-            print("[NavController] Ground truth pose: Not available")
 
     def get_command(self) -> np.ndarray:
         """
@@ -788,20 +931,67 @@ class NavController:
             Array (3, ) with the structure  [lin_vel_x, lin_vel_y, ang_vel_z] in robot body frame.
             All values should be in range [-1, 1] representing normalized velocities.
         """
-        # Example placeholder - simple forward motion:
-        lin_vel_x = 0.0  # Move forward at reduced speed
-        lin_vel_y = 0.0  # No lateral motion
-        ang_vel_z = 0.0  # No rotation
+        if self.goal is None:
+            self.state = "WAIT_FOR_LOCALIZATION"
+            return np.zeros(3, dtype=np.float32)
 
-        # TODO MRSS26: Implement navigation logic
+        goal_delta_world = self.goal - self.robot_pose[:2]
+        goal_distance = float(np.linalg.norm(goal_delta_world))
+        if goal_distance <= self.goal_tolerance:
+            self.state = "ARRIVED"
+            self.avoid_side = 0
+            return np.zeros(3, dtype=np.float32)
 
-        # Ensure commands are in valid range
-        lin_vel_x = np.clip(lin_vel_x, -1.0, 1.0)
-        lin_vel_y = np.clip(lin_vel_y, -1.0, 1.0)
-        ang_vel_z = np.clip(ang_vel_z, -1.0, 1.0)
+        cosine = np.cos(self.robot_pose[2])
+        sine = np.sin(self.robot_pose[2])
+        world_to_body = np.array([[cosine, sine], [-sine, cosine]], dtype=np.float64)
+        goal_direction_body = world_to_body @ (goal_delta_world / goal_distance)
+        attraction_strength = min(1.0, goal_distance / 0.60)
+        desired_translation = self.goal_attraction_gain * attraction_strength * goal_direction_body
+        desired_translation += self._wall_repulsion_body()
+        desired_translation += self.local_obstacle_repulsion
 
-        command = np.array([lin_vel_x, lin_vel_y, ang_vel_z], dtype=np.float32)
+        # Keep the initially selected side until the front has remained clear.
+        # This tangential component prevents attraction and repulsion from
+        # cancelling directly in front of a broad obstacle.
+        if self.avoid_side:
+            desired_translation += np.array([0.20, 0.90 * self.avoid_side], dtype=np.float64)
+        else:
+            self.state = "GO_TO_GOAL"
 
+        if self.nearest_front_obstacle < self.emergency_distance:
+            escape_side = self.avoid_side if self.avoid_side else 1
+            desired_translation += np.array([-1.20, 1.20 * escape_side], dtype=np.float64)
+
+        desired_norm = float(np.linalg.norm(desired_translation))
+        if desired_norm < 1.0e-6:
+            desired_translation = goal_direction_body
+            desired_norm = 1.0
+        desired_direction = desired_translation / desired_norm
+
+        # Translation is the primary steering mechanism.  Yaw only follows the
+        # safe translation direction so vx/vy remain effective during turns.
+        translation_speed = min(self.maximum_translation_speed, 0.9 * goal_distance)
+        lin_vel_x = translation_speed * desired_direction[0]
+        lin_vel_y = translation_speed * desired_direction[1]
+        desired_heading = float(np.arctan2(desired_direction[1], desired_direction[0]))
+        ang_vel_z = np.clip(
+            self.yaw_command_gain * desired_heading,
+            -self.maximum_yaw_speed,
+            self.maximum_yaw_speed,
+        )
+
+        if self.nearest_front_obstacle < self.emergency_distance:
+            lin_vel_x = min(lin_vel_x, 0.0)
+
+        command = np.array(
+            [
+                np.clip(lin_vel_x, -1.0, 1.0),
+                np.clip(lin_vel_y, -1.0, 1.0),
+                np.clip(ang_vel_z, -1.0, 1.0),
+            ],
+            dtype=np.float32,
+        )
         return command
 
     def reset(self) -> None:
@@ -811,6 +1001,7 @@ class NavController:
         Called when the environment/robot is reset.
         """
         self.robot_pose = np.zeros(3, dtype=np.float64)
+        self.goal = None
         self.pose_variance = self.initial_pose_variance
         self.yaw_variance = self.initial_pose_variance
         self.pose_covariance = np.diag([self.pose_variance, self.pose_variance, self.yaw_variance])
@@ -824,6 +1015,12 @@ class NavController:
         self.projected_gravity[:] = (0.0, 0.0, -1.0)
         self.occupancy_grid.fill(0.0)
         self.map_update_count = 0
+        self.local_obstacle_repulsion.fill(0.0)
+        self.nearest_front_obstacle = np.inf
+        self.left_clearance = self.obstacle_detection_range
+        self.right_clearance = self.obstacle_detection_range
+        self.avoid_side = 0
+        self.avoid_clear_frames = 0
         self.landmark_map = {tag_id: list(position) for tag_id, position in TAG_POSITIONS.items()}
         self.detection_buffer.clear()
         self.has_absolute_pose_fix = False
@@ -843,6 +1040,12 @@ class NavController:
             "landmark_count": len(self.landmark_map),
             "landmark_map": self.landmark_map,
             "state": self.state,
+            "goal": None if self.goal is None else self.goal.tolist(),
+            "local_obstacle_repulsion": self.local_obstacle_repulsion.tolist(),
+            "nearest_front_obstacle": self.nearest_front_obstacle,
+            "left_clearance": self.left_clearance,
+            "right_clearance": self.right_clearance,
+            "avoid_side": self.avoid_side,
             "path": self.path,
             "map_update_count": self.map_update_count,
             "map_resolution": self.map_resolution,
