@@ -81,6 +81,7 @@ def create_arena_usd(output_path: str, arena_size: float = 5.0):
     corner_offset = 1.25
     wall_offset = wall_thickness / 2
     z_height = 0.3
+    high_tag_z = 0.7
 
     tag_transforms = [
         # (tag_id, position, rotation)
@@ -92,6 +93,15 @@ def create_arena_usd(output_path: str, arena_size: float = 5.0):
         (5, (arena_half_size - wall_offset, -arena_half_size + corner_offset, z_height), (0, -90, -90)),  # right-bottom
         (6, (arena_half_size - corner_offset, -arena_half_size + wall_offset, z_height), (-90, 0, 180)),  # bottom-right
         (7, (-arena_half_size + corner_offset, -arena_half_size + wall_offset, z_height), (-90, 0, 180)),  # bottom-left
+        # Extra landmarks at the centre of each wall. These improve tag
+        # visibility when terrain or obstacles occlude the corner landmarks.
+        (8, (0.0, arena_half_size - wall_offset, z_height), (90, 0, 0)),  # top-centre
+        (9, (0.0, -arena_half_size + wall_offset, z_height), (-90, 0, 180)),  # bottom-centre
+        (10, (-arena_half_size + wall_offset, 0.0, z_height), (0, 90, 90)),  # left-centre
+        (11, (arena_half_size - wall_offset, 0.0, z_height), (0, -90, -90)),  # right-centre
+        # Higher landmarks remain visible when the lower row is occluded.
+        (12, (0.0, arena_half_size - wall_offset, high_tag_z), (90, 0, 0)),  # top-centre high
+        (13, (0.0, -arena_half_size + wall_offset, high_tag_z), (-90, 0, 180)),  # bottom-centre high
     ]
 
     # List of all possible tag IDs (0-13)

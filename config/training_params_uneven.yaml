@@ -5,13 +5,13 @@ max_iterations: 1500  # Adjust this to train for longer: 1.5k should give you a 
 penalize_target_height: true # Set false to remove the base-height deviation penalty during training
 randomize_actuator_response: false # Randomize motor strength by +/-10% and response smoothing by 0-10%
 
-seed: 69 # Performance should be somewhat consistent across seeds
+seed: 1003 # Performance should be somewhat consistent across seeds
 
 video: false  # Record videos during training.
 video_length: 10  # Length of the recorded video (in steps).
 video_interval: 10  # Interval between video recordings (in steps).
 
-run_name: uneven_new_rewards  # Run name suffix to the log directory.
+run_name: uneven_better_rewards  # Run name suffix to the log directory.
 experiment_name: go1_locomotion_height_training  # Folder under logs/rsl_rl used for checkpoints.
 resume: false  # Whether to resume from a checkpoint.
 #load_run: LOAD_RUN   # Name of the run folder to resume from.
@@ -20,7 +20,7 @@ logger: wandb  # Logger module to use. {neptune, wandb, tensorboard}
 log_project_name: MRSS26  # Name of the logging project when using wandb or neptune.
 env:
   scene:
-    num_envs: 2048 #Number of environments to generate terrain for and run in parallel.
+    num_envs: 1024 #Number of environments to generate terrain for and run in parallel.
 
     terrain:
       max_init_terrain_level: 5  # Maximum initial difficulty level of terrains for curriculum learning
@@ -51,15 +51,15 @@ env:
           # pyramid_slope_inv:
           #   proportion: 0.1
           flat:
-            proportion: 0.80
+            proportion: 0.7
           pyramid_stairs:
             proportion: 0.0
           pyramid_stairs_inv:
             proportion: 0.0
           boxes:
-            proportion: 0.1
+            proportion: 0.15
           random_rough:
-            proportion: 0.1
+            proportion: 0.15
           pyramid_slope:
             proportion: 0.0
           pyramid_slope_inv:
@@ -96,11 +96,11 @@ env:
     dof_torques_l2:
       # weight: -0.0002  # Penalty for large joint torques (encourages energy efficiency)
       # weight: -0.001
-      weight: -0.0002
+      weight: -0.0005
     feet_air_time:
       # weight: 0.01  # Reward for time feet spend in the air (encourages stepping/gait)
       # weight: 0.125
-      weight: 0.8
+      weight: 0.3
     flat_orientation_l2:
       # weight: 0.0  # Penalty for orientation deviation from flat (disabled here)
       # weight: 0.01
@@ -110,10 +110,10 @@ env:
       # weight: -1.0
       weight: -2.0
     track_ang_vel_z_exp:
-      weight: 3.0  # Reward for matching desired angular velocity around z-axis (yaw control)
+      weight: 1.5  # Reward for matching desired angular velocity around z-axis (yaw control)
     track_lin_vel_xy_exp:
       # weight: 1.5  # Reward for matching desired linear velocity in x-y plane
-      weight: 3.5
+      weight: 2.5
 
   events:
     add_base_mass:
