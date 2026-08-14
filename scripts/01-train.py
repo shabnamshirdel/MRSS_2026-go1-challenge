@@ -10,6 +10,7 @@
 import argparse
 import sys
 import os
+import shutil
 
 from isaaclab.app import AppLauncher
 
@@ -58,7 +59,8 @@ args_cli, hydra_args = parser.parse_known_args()
 config_params = {}
 if args_cli.config:
     import yaml
-    with open(args_cli.config) as f:
+    config_source_path = os.path.abspath(os.path.expanduser(args_cli.config))
+    with open(config_source_path) as f:
         config_params = yaml.safe_load(f) or {}
 
     # Pre-populate args_cli attributes if they are defined in config and not passed on CLI
@@ -242,6 +244,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if "env" in config_params:
         env_cfg.from_dict(config_params["env"])
 
+    use_velocity_conditioned_feet_air_time = config_params.get(
+        "use_velocity_conditioned_feet_air_time", False
+    )
+    if not isinstance(use_velocity_conditioned_feet_air_time, bool):
+        raise TypeError("use_velocity_conditioned_feet_air_time must be either true or false.")
+    if not hasattr(env_cfg, "rewards"):
+        raise ValueError("The selected task does not define rewards for the feet-air-time toggle.")
+    if use_velocity_conditioned_feet_air_time:
+        if not hasattr(env_cfg.rewards, "velocity_conditioned_feet_air_time"):
+            raise ValueError("The selected task does not define velocity_conditioned_feet_air_time.")
+        env_cfg.rewards.feet_air_time = None
+        print("[INFO] Using velocity-conditioned target feet-air-time reward.")
+    else:
+        if not hasattr(env_cfg.rewards, "feet_air_time"):
+            raise ValueError("The selected task does not define feet_air_time.")
+        env_cfg.rewards.velocity_conditioned_feet_air_time = None
+        print("[INFO] Using the original feet-air-time reward.")
+
+    use_prolonged_foot_contact = config_params.get(
+        "use_prolonged_foot_contact_instead_of_feet_slide", False
+    )
+    if not isinstance(use_prolonged_foot_contact, bool):
+        raise TypeError("use_prolonged_foot_contact_instead_of_feet_slide must be either true or false.")
+    if use_prolonged_foot_contact:
+        if not hasattr(env_cfg.rewards, "prolonged_foot_contact"):
+            raise ValueError("The selected task does not define prolonged_foot_contact.")
+        env_cfg.rewards.feet_slide = None
+        print("[INFO] Using prolonged-foot-contact penalty instead of feet-slide penalty.")
+    else:
+        if not hasattr(env_cfg.rewards, "feet_slide"):
+            raise ValueError("The selected task does not define feet_slide.")
+        env_cfg.rewards.prolonged_foot_contact = None
+        print("[INFO] Using feet-slide penalty instead of prolonged-foot-contact penalty.")
+
     penalize_target_height = config_params.get("penalize_target_height", True)
     if not isinstance(penalize_target_height, bool):
         raise TypeError("'penalize_target_height' must be either true or false in the training config.")
@@ -302,6 +338,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
     log_dir = os.path.join(log_root_path, log_dir)
+
+    # Preserve the exact user-supplied training YAML (including comments) in
+    # every run directory, alongside the generated checkpoints and logs.
+    os.makedirs(log_dir, exist_ok=True)
+    config_snapshot_path = os.path.join(log_dir, os.path.basename(config_source_path))
+    shutil.copy2(config_source_path, config_snapshot_path)
+    print(f"[INFO] Saved training configuration to: {config_snapshot_path}")
 
     if isinstance(env_cfg, ManagerBasedRLEnvCfg):
         env_cfg.export_io_descriptors = args_cli.export_io_descriptors
