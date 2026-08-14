@@ -128,7 +128,9 @@ class NavController:
         self.visible_surfaces: list[tuple[np.ndarray, float, np.ndarray]] = []
         self.tracked_surface_world = None
         self.tracked_surface_age = 0
-        self.tracked_surface_max_age = 30
+        # Long enough to traverse one small-arena wall after it moves outside
+        # the front camera; a newly visible wall immediately replaces it.
+        self.tracked_surface_max_age = 200
         self.wall_follow_distance = self.preferred_surface_clearance
         self.wall_follow_forward_speed = 0.22
         self.open_search_speed = 0.28
@@ -430,9 +432,32 @@ class NavController:
     def _tag_kind(self, tag_id: int) -> str:
         return "goal" if tag_id == self.goal_tag_id else "landmark"
 
-    def _update_visible_tag_points(self, detections: dict[int, dict]) -> None:
-        """Store current tag centers in planar body coordinates."""
-        points = []
+    @staticmethod
+    def _surface_geometry(
+        point_body_3d: np.ndarray, normal_body: np.ndarray
+    ) -> tuple[np.ndarray, float, np.ndarray] | None:
+        """Return tag point, plane distance, and planar direction to the wall."""
+        point_body_3d = np.asarray(point_body_3d, dtype=np.float64).reshape(3)
+        normal_body = np.asarray(normal_body, dtype=np.float64).reshape(3)
+        point_body = point_body_3d[:2]
+        point_range = float(np.linalg.norm(point_body))
+        normal_xy = normal_body[:2]
+        normal_xy_norm = float(np.linalg.norm(normal_xy))
+        if point_range <= 0.05:
+            return None
+        if normal_xy_norm < 0.45:
+            return point_body, point_range, point_body / point_range
+        normal_body /= max(float(np.linalg.norm(normal_body)), 1.0e-6)
+        normal_xy = normal_body[:2] / np.linalg.norm(normal_body[:2])
+        sign = 1.0 if np.dot(normal_xy, point_body) >= 0.0 else -1.0
+        toward_surface = sign * normal_xy
+        distance = min(abs(float(np.dot(normal_body, point_body_3d))), point_range)
+        return point_body, distance, toward_surface
+
+    def _update_visible_surfaces(self, detections: dict[int, dict]) -> None:
+        """Extract current wall planes and retain the closest one briefly."""
+        surfaces = []
+        world_surfaces = []
         for tag_info in detections.values():
             if float(tag_info.get("confidence", 0.0)) < 0.5 * self.minimum_tag_confidence:
                 continue
@@ -440,59 +465,84 @@ class NavController:
                 translation = np.asarray(
                     tag_info["pose"]["position"], dtype=np.float64
                 ).reshape(3)
+                rotation_camera_from_tag = np.asarray(
+                    tag_info["pose"]["rotation_matrix"], dtype=np.float64
+                ).reshape(3, 3)
+                point_body_3d = (
+                    self.camera_offset_body + CAMERA_TO_BODY_ROTATION @ translation
+                )
+                normal_body = CAMERA_TO_BODY_ROTATION @ rotation_camera_from_tag[:, 2]
+                surface = self._surface_geometry(point_body_3d, normal_body)
+                position_world, rotation_world_from_tag = self._observed_tag_world_pose(tag_info)
             except (KeyError, TypeError, ValueError):
                 continue
-            point = np.array(
-                [translation[2] + self.camera_offset_body[0], -translation[0]],
-                dtype=np.float64,
+            if surface is None or not np.all(np.isfinite(surface[0])):
+                continue
+            surfaces.append(surface)
+            world_surfaces.append(
+                {
+                    "position": position_world,
+                    "normal": rotation_world_from_tag[:, 2],
+                }
             )
-            if np.all(np.isfinite(point)) and np.linalg.norm(point) > 0.05:
-                points.append(point)
-        self.visible_tag_points = points
+        self.visible_surfaces = surfaces
+        if surfaces:
+            closest = int(np.argmin([surface[1] for surface in surfaces]))
+            self.tracked_surface_world = world_surfaces[closest]
+            self.tracked_surface_age = 0
+        else:
+            self.tracked_surface_age += 1
 
-    def _visible_surface(self) -> tuple[float, float] | None:
-        """Return range and bearing of the nearest visible tag cluster."""
-        if not self.visible_tag_points:
+    def _visible_surface(self) -> tuple[float, float, np.ndarray] | None:
+        """Return distance, bearing, and direction toward the tracked wall."""
+        if self.visible_surfaces:
+            point, distance, toward_surface = min(
+                self.visible_surfaces, key=lambda surface: surface[1]
+            )
+            return distance, float(np.arctan2(point[1], point[0])), toward_surface
+        if self.tracked_surface_world is None or self.tracked_surface_age > self.tracked_surface_max_age:
             return None
-        points = np.asarray(self.visible_tag_points, dtype=np.float64)
-        ranges = np.linalg.norm(points, axis=1)
-        valid = points[:, 0] > 0.05
-        if not np.any(valid):
-            return None
-        points = points[valid]
-        ranges = ranges[valid]
-        nearest = float(np.min(ranges))
-        cluster = ranges <= nearest + 0.30
-        points = points[cluster]
-        ranges = ranges[cluster]
-        weights = 1.0 / np.maximum(ranges, 0.10)
-        bearings = np.arctan2(points[:, 1], points[:, 0])
-        bearing = np.arctan2(
-            np.sum(weights * np.sin(bearings)),
-            np.sum(weights * np.cos(bearings)),
+
+        rotation_world_from_body = self._body_rotation_world()
+        rotation_body_from_world = rotation_world_from_body.T
+        position_world_body = np.array(
+            [self.robot_pose[0], self.robot_pose[1], 0.0], dtype=np.float64
         )
-        distance = float(np.sum(weights * ranges) / np.sum(weights))
-        return distance, float(bearing)
+        point_body_3d = rotation_body_from_world @ (
+            np.asarray(self.tracked_surface_world["position"]) - position_world_body
+        )
+        normal_body = rotation_body_from_world @ np.asarray(
+            self.tracked_surface_world["normal"]
+        )
+        surface = self._surface_geometry(point_body_3d, normal_body)
+        if surface is None:
+            return None
+        point, distance, toward_surface = surface
+        return distance, float(np.arctan2(point[1], point[0])), toward_surface
 
     def _apply_surface_clearance(self, command: np.ndarray) -> np.ndarray:
         """Gently drift away and enforce the minimum tag-surface distance."""
-        if not self.visible_tag_points:
-            return np.asarray(command, dtype=np.float64)
-        point = min(self.visible_tag_points, key=lambda item: np.linalg.norm(item))
-        distance = float(np.linalg.norm(point))
-        if distance >= self.preferred_surface_clearance:
-            return np.asarray(command, dtype=np.float64)
-
+        surface = self._visible_surface()
         adjusted = np.asarray(command, dtype=np.float64).copy()
-        toward_surface = point / max(distance, 1.0e-6)
-        repulsion = 0.55 * (self.preferred_surface_clearance - distance)
-        adjusted[:2] -= repulsion * toward_surface
+        adjusted[1] = 0.0
+        if surface is None:
+            return adjusted
+        distance, bearing, toward_surface = surface
+        if distance >= self.preferred_surface_clearance:
+            return adjusted
+
+        toward_speed = float(adjusted[0] * toward_surface[0])
+        if toward_speed > 0.0:
+            scale = np.clip(
+                (distance - self.minimum_surface_clearance)
+                / (self.preferred_surface_clearance - self.minimum_surface_clearance),
+                0.0,
+                1.0,
+            )
+            adjusted[0] *= scale
         if distance < self.minimum_surface_clearance:
-            toward_speed = float(np.dot(adjusted[:2], toward_surface))
-            if toward_speed > 0.0:
-                adjusted[:2] -= toward_speed * toward_surface
-            escape = 0.18 + 0.60 * (self.minimum_surface_clearance - distance)
-            adjusted[:2] -= escape * toward_surface
+            adjusted[0] = -0.16 if abs(bearing) < 0.70 else 0.0
+            adjusted[2] = self.corner_turn_speed * self.wall_follow_direction
             self.state = "SURFACE_BACKOFF"
         return adjusted
 
@@ -508,12 +558,11 @@ class NavController:
             self.state = "ARRIVED"
             return np.zeros(3, dtype=np.float32)
 
-        direction = target / max(distance, 1.0e-6)
-        forward = np.clip(0.70 * radial_error * direction[0], 0.0, 0.35)
-        lateral = np.clip(0.50 * radial_error * direction[1], -0.18, 0.18)
+        alignment = max(0.0, float(np.cos(bearing)))
+        forward = np.clip(0.70 * radial_error * alignment, 0.0, 0.35)
         yaw = np.clip(0.90 * bearing, -self.maximum_yaw_speed, self.maximum_yaw_speed)
         self.state = "APPROACH_GOAL"
-        return np.array([forward, lateral, yaw], dtype=np.float32)
+        return np.array([forward, 0.0, yaw], dtype=np.float32)
 
     def _exploration_command(self) -> np.ndarray:
         """Enter open space once, then follow every tagged wall consistently."""
@@ -530,34 +579,51 @@ class NavController:
             # Tags normally disappear at a corner.  Keep turning in exactly the
             # same direction until tags on the next wall enter the camera.
             self.state = "TURN_CORNER"
-            lateral = 0.10 * self.wall_follow_direction if self.frames_without_surface <= 6 else 0.0
-            forward = 0.0 if self.frames_without_surface <= 18 else 0.10
+            forward = 0.0 if self.frames_without_surface <= 12 else 0.08
             return np.array(
-                [forward, lateral, self.corner_turn_speed * self.wall_follow_direction],
+                [forward, 0.0, self.corner_turn_speed * self.wall_follow_direction],
                 dtype=np.float32,
             )
 
         self.frames_without_surface = 0
-        distance, bearing = surface
-        yaw = np.clip(1.10 * bearing, -self.maximum_yaw_speed, self.maximum_yaw_speed)
+        distance, bearing, toward_surface = surface
 
         if not self.wall_follow_started:
             if distance > self.wall_follow_distance + 0.08:
                 forward = np.clip(
                     0.65 * (distance - self.wall_follow_distance), 0.08, 0.30
                 )
+                forward *= max(0.0, float(np.cos(bearing)))
+                yaw = np.clip(
+                    1.10 * bearing, -self.maximum_yaw_speed, self.maximum_yaw_speed
+                )
                 self.state = "APPROACH_WALL"
                 return np.array([forward, 0.0, yaw], dtype=np.float32)
             self.wall_follow_started = True
 
-        # Face the tags, correct distance with vx, and translate along the wall
-        # using one unchanging vy sign.  This directly scans tags wall by wall.
-        forward = np.clip(
-            0.75 * (distance - self.wall_follow_distance), -0.18, 0.18
+        # Build a forward-only desired heading from a fixed wall tangent plus a
+        # small distance correction.  The robot turns first, then walks ahead.
+        tangent = self.wall_follow_direction * np.array(
+            [-toward_surface[1], toward_surface[0]], dtype=np.float64
         )
-        lateral = self.wall_follow_lateral_speed * self.wall_follow_direction
+        distance_correction = np.clip(
+            0.55 * (distance - self.wall_follow_distance), -0.16, 0.16
+        )
+        desired_direction = (
+            self.wall_follow_forward_speed * tangent
+            + distance_correction * toward_surface
+        )
+        heading_error = float(
+            np.arctan2(desired_direction[1], desired_direction[0])
+        )
+        yaw = np.clip(
+            1.20 * heading_error, -self.maximum_yaw_speed, self.maximum_yaw_speed
+        )
+        forward = np.linalg.norm(desired_direction) * max(
+            0.0, float(np.cos(heading_error))
+        )
         self.state = "FOLLOW_WALL"
-        return np.array([forward, lateral, yaw], dtype=np.float32)
+        return np.array([forward, 0.0, yaw], dtype=np.float32)
 
     # ------------------------------------------------------------------
     # Public controller API
@@ -621,12 +687,12 @@ class NavController:
         else:
             self.goal_relative_body = None
 
-        self._update_visible_tag_points(detections)
+        self._update_visible_surfaces(detections)
+        tracked_surface = self._visible_surface()
         free_surface_clearance = (
             None
-            if not self.visible_tag_points
-            else min(np.linalg.norm(point) for point in self.visible_tag_points)
-            - self.robot_body_clearance_radius
+            if tracked_surface is None
+            else tracked_surface[0] - self.robot_body_clearance_radius
         )
         clearance_text = (
             "unknown" if free_surface_clearance is None else f"{free_surface_clearance:.2f} m"
@@ -672,7 +738,9 @@ class NavController:
         self.landmark_map.clear()
         self.previous_tag_anchors.clear()
         self.visible_tags.clear()
-        self.visible_tag_points.clear()
+        self.visible_surfaces.clear()
+        self.tracked_surface_world = None
+        self.tracked_surface_age = 0
         self.goal_relative_body = None
         self.goal_world_position = None
         self.path.clear()
@@ -700,9 +768,8 @@ class NavController:
             "pose_source": self.last_pose_source,
             "surface_clearance": (
                 None
-                if not self.visible_tag_points
-                else float(min(np.linalg.norm(point) for point in self.visible_tag_points))
-                - self.robot_body_clearance_radius
+                if self._visible_surface() is None
+                else float(self._visible_surface()[0]) - self.robot_body_clearance_radius
             ),
             "state": self.state,
             "goal_tag_id": self.goal_tag_id,
