@@ -19,10 +19,6 @@ from pyapriltags import Detector
 # Change this default, or pass goal_tag_id to NavController, for the arena.
 DEFAULT_GOAL_TAG_ID = 0
 
-# Optional per-tag overrides.  By default, non-goal IDs below 20 are walls,
-# IDs above 20 are obstacles, and ID 20 is generic.
-DEFAULT_TAG_TYPES: dict[int, str] = {}
-
 # OpenCV camera axes (right, down, forward) expressed in Go1 body axes
 # (forward, left, up).
 CAMERA_TO_BODY_ROTATION = np.array(
@@ -53,9 +49,8 @@ class NavController:
             tag_size: Length of the AprilTag black square in meters.
             tag_family: AprilTag family used in the arena.
             goal_tag_id: ID of the goal tag.  Its position is not required.
-            tag_types: Optional mapping from tag ID to ``wall``, ``obstacle``,
-                or ``goal``.  Unlisted non-goal tags are treated conservatively
-                as generic obstacles.
+            tag_types: Retained for call-site compatibility.  All non-goal tags
+                are handled identically by exploration.
         """
         if isinstance(camera_params, dict):
             camera_params = tuple(camera_params[name] for name in ("fx", "fy", "cx", "cy"))
@@ -66,8 +61,6 @@ class NavController:
         self.tag_size = float(tag_size)
         self.tag_family = tag_family
         self.goal_tag_id = int(goal_tag_id)
-        self.tag_types = dict(DEFAULT_TAG_TYPES if tag_types is None else tag_types)
-        self.tag_types[self.goal_tag_id] = "goal"
         self.at_detector = Detector(
             families=tag_family,
             nthreads=1,
@@ -99,13 +92,16 @@ class NavController:
         self.camera_frame_dt = 0.1
         self.last_pose_source = "initial"
 
-        # Sparse tag map.  Each tag stores a full map-frame pose, uncertainty,
-        # observation count, and semantic type.
+        # Sparse tag map plus one-frame anchors for continuous relative tag
+        # odometry.  The global map never directly teleports the robot pose.
         self.landmark_map: dict[int, dict[str, Any]] = {}
+        self.previous_tag_anchors: dict[int, dict[str, Any]] = {}
         self.visible_tags: dict[int, dict[str, Any]] = {}
         self.minimum_tag_confidence = 15.0
         self.maximum_tag_position_innovation = 0.45
         self.maximum_tag_yaw_disagreement = np.radians(20.0)
+        self.maximum_tag_odometry_position_jump = 0.30
+        self.maximum_tag_odometry_yaw_jump = np.radians(30.0)
         self.tag_position_gain = 0.90
         self.tag_yaw_gain = 0.85
         self.tag_map_update_count = 0
@@ -117,19 +113,36 @@ class NavController:
         self.goal_standoff_distance = 0.55
         self.goal_distance_tolerance = 0.08
 
-        # Tag-space gap exploration.  A tag blocks an angular interval based on
-        # range and a conservative semantic safety radius.
+        # All non-goal tags represent a nearby surface with the same safety
+        # treatment; IDs do not classify walls or obstacles.
         self.sector_count = 41
         self.sector_angles = np.linspace(-0.5, 0.5, self.sector_count)
         self.sector_clearance = np.full(self.sector_count, 3.0, dtype=np.float64)
         self.maximum_tag_avoidance_range = 2.0
         self.emergency_tag_distance = 0.35
         self.front_blocking_distance = 0.75
-        self.wall_safety_radius = 0.55
-        self.obstacle_safety_radius = 0.50
-        self.generic_safety_radius = 0.42
+        self.tag_safety_radius = 0.48
+        self.visible_surface_points: list[np.ndarray] = []
         self.best_gap_angle = 0.0
         self.preferred_turn_side = 1
+
+        # Search tag-bearing surfaces instead of remaining at the first wall.
+        # The robot approaches a surface, travels along it while looking at it,
+        # then backs away and searches elsewhere after a bounded scan.
+        self.wall_scan_active = False
+        self.wall_scan_side = 1
+        self.wall_scan_steps = 0
+        self.wall_scan_lost_frames = 0
+        self.wall_scan_target_distance = 0.68
+        self.wall_scan_entry_distance = 0.95
+        self.wall_scan_max_steps = 45
+        self.wall_scan_min_steps = 10
+        self.wall_scan_no_new_tag_limit = 18
+        self.wall_scan_lost_limit = 5
+        self.wall_scan_cooldown_steps = 0
+        self.wall_scan_cooldown_duration = 20
+        self.leave_wall_steps_remaining = 0
+        self.leave_wall_duration_steps = 12
 
         # Exploration memory prevents repeated loops without maintaining a
         # dense grid.  Positions are counted in coarse 0.5 m cells.
@@ -303,27 +316,41 @@ class NavController:
         position_world_body = position_world_camera - rotation_world_from_body @ self.camera_offset_body
         return np.array([position_world_body[0], position_world_body[1], yaw], dtype=np.float64)
 
-    def _correct_pose_from_known_landmarks(self, detections: dict[int, dict]) -> bool:
-        """Use reobserved tags as the primary robot-pose measurement."""
+    def _estimate_pose_from_tag_odometry(self, detections: dict[int, dict]) -> bool:
+        """Estimate motion from tags shared with the preceding camera frame."""
         measurements = []
         weights = []
         for tag_id, tag_info in detections.items():
-            landmark = self.landmark_map.get(tag_id)
-            if landmark is None or float(tag_info.get("confidence", 0.0)) < self.minimum_tag_confidence:
+            anchor = self.previous_tag_anchors.get(tag_id)
+            if anchor is None or float(tag_info.get("confidence", 0.0)) < self.minimum_tag_confidence:
                 continue
             confidence = float(tag_info["confidence"])
             distance = float(tag_info["distance"])
-            measurement = self._robot_measurement_from_landmark(landmark, tag_info)
+            measurement = self._robot_measurement_from_landmark(anchor, tag_info)
             if not np.all(np.isfinite(measurement)):
                 continue
             variance = max(1.0e-4, (0.03 + 0.025 * distance * distance) ** 2)
             measurements.append(measurement)
-            weights.append(confidence / (variance + float(landmark["variance"])))
+            weights.append(confidence / (variance + float(anchor["variance"])))
 
         if not measurements:
             return False
         poses = np.asarray(measurements)
         weights_array = np.asarray(weights)
+
+        # A consecutive-frame observation cannot physically move the robot a
+        # large distance.  Reject planar-pose flips before consensus/fusion.
+        position_innovation = np.linalg.norm(poses[:, :2] - self.robot_pose[:2], axis=1)
+        yaw_innovation = np.abs(
+            np.array([_wrap_angle(yaw - self.robot_pose[2]) for yaw in poses[:, 2]])
+        )
+        plausible = (
+            position_innovation <= self.maximum_tag_odometry_position_jump
+        ) & (yaw_innovation <= self.maximum_tag_odometry_yaw_jump)
+        if not np.any(plausible):
+            return False
+        poses = poses[plausible]
+        weights_array = weights_array[plausible]
 
         # Reject a bad PnP solution or a poorly initialized landmark by using
         # the candidate pose with the strongest nearby consensus as reference.
@@ -363,8 +390,27 @@ class NavController:
         self.pose_variance = measurement_variance
         self.yaw_variance = max(measurement_variance, np.radians(1.5) ** 2)
         self.pose_covariance = np.diag([self.pose_variance, self.pose_variance, self.yaw_variance])
-        self.last_pose_source = "apriltag"
+        self.last_pose_source = "apriltag_relative"
         return True
+
+    def _store_tag_odometry_anchors(self, detections: dict[int, dict]) -> None:
+        """Store current tag poses for the next frame's relative odometry."""
+        anchors = {}
+        for tag_id, tag_info in detections.items():
+            confidence = float(tag_info.get("confidence", 0.0))
+            if confidence < self.minimum_tag_confidence:
+                continue
+            try:
+                position, rotation = self._observed_tag_world_pose(tag_info)
+                distance = float(tag_info["distance"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            anchors[tag_id] = {
+                "position": position,
+                "rotation_matrix": rotation,
+                "variance": max(1.0e-4, (0.03 + 0.025 * distance * distance) ** 2),
+            }
+        self.previous_tag_anchors = anchors
 
     def _update_landmark_map(self, detections: dict[int, dict]) -> None:
         """Register new tag anchors and count their later observations."""
@@ -379,6 +425,10 @@ class NavController:
                 continue
             distance = float(tag_info["distance"])
             variance = max(1.0e-4, (0.03 + 0.025 * distance * distance) ** 2)
+            if tag_id == self.goal_tag_id:
+                # Keep reacquisition consistent with the current relative map,
+                # even if the original sparse landmark was initialized earlier.
+                self.goal_world_position = np.asarray(position[:2]).copy()
             landmark = self.landmark_map.get(tag_id)
             if landmark is None:
                 new_tag_seen = True
@@ -401,8 +451,6 @@ class NavController:
 
             self.tag_map_update_count += 1
             self.seen_tag_ids.add(tag_id)
-            if tag_id == self.goal_tag_id:
-                self.goal_world_position = np.asarray(self.landmark_map[tag_id]["position"][:2]).copy()
 
         self.frames_since_new_tag = 0 if new_tag_seen else self.frames_since_new_tag + 1
         save_due = (
@@ -416,23 +464,7 @@ class NavController:
     # Gap exploration and goal approach
     # ------------------------------------------------------------------
     def _tag_kind(self, tag_id: int) -> str:
-        if tag_id == self.goal_tag_id:
-            return "goal"
-        if tag_id in self.tag_types:
-            return self.tag_types[tag_id]
-        if tag_id < 20:
-            return "wall"
-        if tag_id > 20:
-            return "obstacle"
-        return "generic"
-
-    def _tag_safety_radius(self, tag_id: int) -> float:
-        kind = self._tag_kind(tag_id)
-        if kind == "wall":
-            return self.wall_safety_radius
-        if kind == "obstacle":
-            return self.obstacle_safety_radius
-        return self.generic_safety_radius
+        return "goal" if tag_id == self.goal_tag_id else "landmark"
 
     def _update_visible_tag_sectors(self, detections: dict[int, dict], image_width: int) -> None:
         """Convert visible and nearby mapped tags into blocked angular sectors."""
@@ -451,17 +483,9 @@ class NavController:
             )
             obstacles.append((tag_id, point_body))
 
-        # Retain memory of close side obstacles even after they leave the
-        # forward camera.  This limits unsafe lateral commands into unseen space.
-        yaw = float(self.robot_pose[2])
-        cosine, sine = np.cos(yaw), np.sin(yaw)
-        world_to_body = np.array([[cosine, sine], [-sine, cosine]])
-        for tag_id, landmark in self.landmark_map.items():
-            if tag_id in detections or tag_id == self.goal_tag_id:
-                continue
-            point_body = world_to_body @ (np.asarray(landmark["position"][:2]) - self.robot_pose[:2])
-            if np.linalg.norm(point_body) < 1.25:
-                obstacles.append((tag_id, point_body))
+        # Navigation uses current metric observations only.  A sparse map with
+        # uncertain tag locations must not create phantom nearby obstacles.
+        self.visible_surface_points = [point.copy() for _, point in obstacles]
 
         for tag_id, point_body in obstacles:
             distance = float(np.linalg.norm(point_body))
@@ -470,7 +494,7 @@ class NavController:
             bearing = float(np.arctan2(point_body[1], point_body[0]))
             if abs(bearing) > half_fov + 0.35:
                 continue
-            angular_radius = np.arctan2(self._tag_safety_radius(tag_id), max(distance, 0.10))
+            angular_radius = np.arctan2(self.tag_safety_radius, max(distance, 0.10))
             blocked = np.abs(self.sector_angles - bearing) <= angular_radius
             self.sector_clearance[blocked] = np.minimum(self.sector_clearance[blocked], distance)
 
@@ -527,6 +551,102 @@ class NavController:
         recent = np.asarray(self.recent_pose_history[-self.stagnation_window :])
         return float(np.linalg.norm(recent[-1] - recent[0])) < self.stagnation_distance
 
+    def _visible_surface(self) -> tuple[float, float] | None:
+        """Return range and bearing of the nearest visible tag cluster."""
+        if not self.visible_surface_points:
+            return None
+        points = np.asarray(self.visible_surface_points, dtype=np.float64)
+        ranges = np.linalg.norm(points, axis=1)
+        valid = (points[:, 0] > 0.05) & (ranges <= self.maximum_tag_avoidance_range)
+        if not np.any(valid):
+            return None
+        points = points[valid]
+        ranges = ranges[valid]
+        nearest = float(np.min(ranges))
+        cluster = ranges <= nearest + 0.35
+        points = points[cluster]
+        ranges = ranges[cluster]
+        weights = 1.0 / np.maximum(ranges, 0.10)
+        bearings = np.arctan2(points[:, 1], points[:, 0])
+        bearing = np.arctan2(
+            np.sum(weights * np.sin(bearings)),
+            np.sum(weights * np.cos(bearings)),
+        )
+        distance = float(np.sum(weights * ranges) / np.sum(weights))
+        return distance, float(bearing)
+
+    def _begin_wall_scan(self) -> None:
+        left = self.sector_angles > 0.0
+        right = self.sector_angles < 0.0
+        left_clearance = float(np.mean(self.sector_clearance[left]))
+        right_clearance = float(np.mean(self.sector_clearance[right]))
+        # If travel to the right is clearer, keep the searched surface on the
+        # left side of the camera, and vice versa.
+        self.wall_scan_side = 1 if right_clearance >= left_clearance else -1
+        self.wall_scan_active = True
+        self.wall_scan_steps = 0
+        self.wall_scan_lost_frames = 0
+        self.recent_pose_history.clear()
+
+    def _begin_leave_wall(self) -> np.ndarray:
+        """Start a bounded retreat that forces exploration away from this wall."""
+        self.wall_scan_active = False
+        self.leave_wall_steps_remaining = self.leave_wall_duration_steps
+        self.wall_scan_cooldown_steps = self.wall_scan_cooldown_duration
+        self.preferred_turn_side = -self.wall_scan_side
+        self.recent_pose_history.clear()
+        self.state = "LEAVE_WALL"
+        return np.array(
+            [-0.18, -0.08 * self.wall_scan_side, 0.42 * self.preferred_turn_side],
+            dtype=np.float32,
+        )
+
+    def _wall_scan_command(self, surface: tuple[float, float] | None) -> np.ndarray:
+        """Move along a tag-bearing surface while keeping it in view."""
+        self.wall_scan_steps += 1
+        if surface is None:
+            self.wall_scan_lost_frames += 1
+        else:
+            self.wall_scan_lost_frames = 0
+
+        scan_finished = self.wall_scan_steps >= self.wall_scan_max_steps
+        no_new_area = (
+            self.wall_scan_steps >= self.wall_scan_min_steps
+            and self.frames_since_new_tag >= self.wall_scan_no_new_tag_limit
+        )
+        if scan_finished or no_new_area or self._stagnating():
+            return self._begin_leave_wall()
+        if self.wall_scan_lost_frames > self.wall_scan_lost_limit:
+            return self._begin_leave_wall()
+
+        if surface is None:
+            # Continue around a likely corner briefly instead of rotating in
+            # place.  A hard lost-frame limit above prevents blind wandering.
+            self.state = "WALL_CORNER_SEARCH"
+            return np.array(
+                [0.14, 0.0, 0.24 * self.wall_scan_side], dtype=np.float32
+            )
+
+        distance, bearing = surface
+        half_fov = max(abs(float(self.sector_angles[0])), abs(float(self.sector_angles[-1])))
+        desired_bearing = self.wall_scan_side * min(0.35, 0.65 * half_fov)
+        bearing_error = _wrap_angle(bearing - desired_bearing)
+        yaw = np.clip(1.15 * bearing_error, -self.maximum_yaw_speed, self.maximum_yaw_speed)
+        radial_error = distance - self.wall_scan_target_distance
+        lateral = self.wall_scan_side * np.clip(0.35 * radial_error, -0.12, 0.12)
+
+        if distance < self.emergency_tag_distance:
+            self.state = "WALL_SCAN_BACKOFF"
+            return np.array([-0.16, -0.14 * self.wall_scan_side, yaw], dtype=np.float32)
+
+        forward = 0.24 * np.clip(
+            (distance - self.emergency_tag_distance) / 0.25,
+            0.30,
+            1.0,
+        )
+        self.state = "WALL_SCAN"
+        return np.array([forward, lateral, yaw], dtype=np.float32)
+
     def _goal_command(self) -> np.ndarray | None:
         """Approach a visible goal tag and stop before its wall."""
         if self.goal_relative_body is None:
@@ -534,11 +654,6 @@ class NavController:
         target = np.asarray(self.goal_relative_body, dtype=np.float64)
         distance = float(np.linalg.norm(target))
         bearing = float(np.arctan2(target[1], target[0]))
-        goal_sector = int(np.argmin(np.abs(self.sector_angles - bearing)))
-        if self.sector_clearance[goal_sector] < self.front_blocking_distance:
-            # Another tag-marked wall/obstacle blocks the direct goal corridor.
-            # Let gap exploration route around it while retaining goal bias.
-            return None
         radial_error = distance - self.goal_standoff_distance
         if radial_error <= self.goal_distance_tolerance and abs(bearing) < 0.15:
             self.state = "ARRIVED"
@@ -552,30 +667,66 @@ class NavController:
         return np.array([forward, lateral, yaw], dtype=np.float32)
 
     def _exploration_command(self) -> np.ndarray:
-        """Explore visible gaps, with scan and anti-stagnation recovery."""
+        """Search successive tag-bearing surfaces without camping at one wall."""
         if self.control_step < self.initial_scan_steps:
             self.state = "INITIAL_SCAN"
             return np.array([0.0, 0.0, 0.35], dtype=np.float32)
         if self.control_step == self.initial_scan_steps:
             self.recent_pose_history.clear()
 
+        if self.leave_wall_steps_remaining > 0:
+            self.leave_wall_steps_remaining -= 1
+            self.state = "LEAVE_WALL"
+            return np.array(
+                [-0.18, -0.08 * self.wall_scan_side, 0.42 * self.preferred_turn_side],
+                dtype=np.float32,
+            )
+
+        if self.wall_scan_cooldown_steps > 0:
+            self.wall_scan_cooldown_steps -= 1
+
+        surface = self._visible_surface()
+        if self.wall_scan_active:
+            return self._wall_scan_command(surface)
+
         if self.recovery_steps_remaining > 0:
             self.recovery_steps_remaining -= 1
             if self.recovery_steps_remaining == 0:
                 self.recent_pose_history.clear()
             self.state = "RECOVERY"
-            return np.array([0.0, 0.0, self.maximum_yaw_speed * self.preferred_turn_side], dtype=np.float32)
+            return np.array(
+                [-0.16, 0.0, self.maximum_yaw_speed * self.preferred_turn_side],
+                dtype=np.float32,
+            )
 
         if self._stagnating() and self.frames_since_new_tag > 5:
             self.preferred_turn_side *= -1
             self.recovery_steps_remaining = self.recovery_duration_steps
             self.recent_pose_history.clear()
             self.state = "RECOVERY"
-            return np.array([0.0, 0.0, self.maximum_yaw_speed * self.preferred_turn_side], dtype=np.float32)
+            return np.array(
+                [-0.16, 0.0, self.maximum_yaw_speed * self.preferred_turn_side],
+                dtype=np.float32,
+            )
 
         if self.frames_without_tags >= self.no_tag_scan_threshold:
-            self.state = "SEARCH_ROTATE"
-            return np.array([0.0, 0.0, 0.35 * self.preferred_turn_side], dtype=np.float32)
+            self.state = "SEARCH_ARC"
+            return np.array([0.16, 0.0, 0.32 * self.preferred_turn_side], dtype=np.float32)
+
+        if (
+            surface is not None
+            and surface[0] <= self.wall_scan_entry_distance
+            and self.wall_scan_cooldown_steps == 0
+        ):
+            self._begin_wall_scan()
+            return self._wall_scan_command(surface)
+
+        if surface is not None and self.wall_scan_cooldown_steps == 0:
+            distance, bearing = surface
+            forward = np.clip(0.45 * (distance - self.wall_scan_target_distance), 0.10, 0.32)
+            yaw = np.clip(0.90 * bearing, -self.maximum_yaw_speed, self.maximum_yaw_speed)
+            self.state = "APPROACH_SURFACE"
+            return np.array([forward, 0.0, yaw], dtype=np.float32)
 
         preferred_angle = None
         if self.goal_world_position is not None:
@@ -588,14 +739,20 @@ class NavController:
         gap_angle = self._select_gap(preferred_angle)
         if gap_angle is None:
             self.state = "TURN_TO_GAP"
-            return np.array([0.0, 0.0, self.maximum_yaw_speed * self.preferred_turn_side], dtype=np.float32)
+            return np.array(
+                [-0.10, 0.0, self.maximum_yaw_speed * self.preferred_turn_side],
+                dtype=np.float32,
+            )
 
         center_index = int(np.argmin(np.abs(self.sector_angles)))
         front_clearance = float(self.sector_clearance[center_index])
         if front_clearance < self.emergency_tag_distance:
             self.preferred_turn_side = 1 if gap_angle >= 0.0 else -1
             self.state = "EMERGENCY_AVOID"
-            return np.array([0.0, 0.15 * self.preferred_turn_side, 0.45 * self.preferred_turn_side], dtype=np.float32)
+            return np.array(
+                [-0.16, 0.12 * self.preferred_turn_side, 0.45 * self.preferred_turn_side],
+                dtype=np.float32,
+            )
 
         alignment = max(0.25, np.cos(gap_angle))
         clearance_factor = np.clip(
@@ -662,8 +819,9 @@ class NavController:
             self._predict_pose_without_tags(dt)
 
         detections = self.detect_apriltags(image)
-        self._correct_pose_from_known_landmarks(detections)
+        self._estimate_pose_from_tag_odometry(detections)
         self._update_landmark_map(detections)
+        self._store_tag_odometry_anchors(detections)
         self.visible_tags = detections
         if detections:
             self.frames_without_tags = 0
@@ -725,7 +883,9 @@ class NavController:
         self.last_sensor_timestamp = None
         self.last_pose_source = "initial"
         self.landmark_map.clear()
+        self.previous_tag_anchors.clear()
         self.visible_tags.clear()
+        self.visible_surface_points.clear()
         self.goal_relative_body = None
         self.goal_world_position = None
         self.sector_clearance.fill(self.maximum_tag_avoidance_range)
@@ -740,6 +900,12 @@ class NavController:
         self.control_step = 0
         self.recovery_steps_remaining = 0
         self.preferred_turn_side = 1
+        self.wall_scan_active = False
+        self.wall_scan_side = 1
+        self.wall_scan_steps = 0
+        self.wall_scan_lost_frames = 0
+        self.wall_scan_cooldown_steps = 0
+        self.leave_wall_steps_remaining = 0
         self.tag_map_update_count = 0
         self.last_saved_tag_map_update = 0
         self.state = "INITIAL_SCAN"
@@ -822,7 +988,7 @@ class NavController:
 
             for first, second in zip(self.path[:-1], self.path[1:]):
                 cv2.line(canvas, to_pixel(first), to_pixel(second), (180, 180, 180), 1)
-            colors = {"wall": (180, 80, 20), "obstacle": (20, 20, 20), "goal": (0, 0, 255)}
+            colors = {"landmark": (30, 90, 200), "goal": (0, 0, 255)}
             for tag_id, data in self.landmark_map.items():
                 pixel = to_pixel(data["position"][:2])
                 color = colors.get(data["kind"], (100, 60, 160))
