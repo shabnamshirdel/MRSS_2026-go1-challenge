@@ -14,30 +14,8 @@ from typing import Any
 
 from pyapriltags import Detector
 
-# Position of the tags in the arena
-TAG_POSITIONS = {
-    0: [1.25, 2.4, 0.5],
-    1: [-1.25, 2.4, 0.5],
-    2: [-2.4, 1.25, 0.5],
-    3: [-2.4, -1.25, 0.5],
-    4: [2.4, 1.25, 0.5],
-    5: [2.4, -1.25, 0.5],
-    6: [1.25, -2.4, 0.5],
-    7: [-1.25, -2.4, 0.5],
-}  # Tags that are not here are obstacles, not landmarks
-
-# The AprilTags lie on the four arena walls.  The tag frame follows OpenCV's
-# convention: +x is image-right, +y is down, and +z points into the wall.
-TAG_WALL_NORMALS = {
-    0: [0.0, 1.0, 0.0],
-    1: [0.0, 1.0, 0.0],
-    2: [-1.0, 0.0, 0.0],
-    3: [-1.0, 0.0, 0.0],
-    4: [1.0, 0.0, 0.0],
-    5: [1.0, 0.0, 0.0],
-    6: [0.0, -1.0, 0.0],
-    7: [0.0, -1.0, 0.0],
-}
+# Positions and wall normals for all arena landmark tags.
+from go1_challenge.arena_assets.tags_loc import TAGS_LOC as TAG_POSITIONS, TAG_WALL_NORMALS
 
 
 def _wrap_angle(angle: float) -> float:
