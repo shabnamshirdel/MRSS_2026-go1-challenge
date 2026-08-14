@@ -172,3 +172,5 @@ cython_debug/
 .idea/
 
 scripts/camera/
+bowl/
+vision/goal/
