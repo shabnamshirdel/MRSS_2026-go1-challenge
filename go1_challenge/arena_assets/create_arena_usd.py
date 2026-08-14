@@ -10,6 +10,51 @@ import omni.usd
 from pxr import Usd, UsdGeom, Gf, UsdShade, Sdf, UsdPhysics
 
 
+APRILTAG_MDL = "assets/textures/AprilTag.mdl"
+
+
+def define_apriltag(stage: Usd.Stage, tag_id: int, mosaic_path: str):
+    """Define an additional tag36h11 mesh and its ID-selecting MDL material."""
+    tag_name = f"tag_{tag_id:02d}"
+    tag_path = f"/World/arena/tags/{tag_name}"
+    tag_xform = UsdGeom.Xform.Define(stage, tag_path)
+    # Copy the explicit cube topology, normals, and face-varying UVs from the
+    # bundled tag. UsdGeom.Cube alone has no authored UVs, which makes the MDL
+    # sample a single atlas texel and renders the tag as a blank square.
+    template = UsdGeom.Mesh(stage.GetPrimAtPath("/World/arena/tags/tag_00/tag_00"))
+    if not template.GetPrim().IsValid():
+        raise RuntimeError("Bundled AprilTag template mesh was not found")
+    tag_mesh = UsdGeom.Mesh.Define(stage, f"{tag_path}/{tag_name}")
+    tag_mesh.CreatePointsAttr(template.GetPointsAttr().Get())
+    tag_mesh.CreateFaceVertexCountsAttr(template.GetFaceVertexCountsAttr().Get())
+    tag_mesh.CreateFaceVertexIndicesAttr(template.GetFaceVertexIndicesAttr().Get())
+    tag_mesh.CreateNormalsAttr(template.GetNormalsAttr().Get())
+    tag_mesh.SetNormalsInterpolation(template.GetNormalsInterpolation())
+    template_st = UsdGeom.PrimvarsAPI(template).GetPrimvar("st")
+    tag_st = UsdGeom.PrimvarsAPI(tag_mesh).CreatePrimvar(
+        "st", Sdf.ValueTypeNames.TexCoord2fArray, template_st.GetInterpolation()
+    )
+    tag_st.Set(template_st.Get())
+    tag_mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+
+    material = UsdShade.Material.Define(stage, f"/World/arena/tags/Looks/AprilTag_{tag_id:02d}")
+    shader = UsdShade.Shader.Define(stage, f"{material.GetPath()}/Shader")
+    shader.CreateImplementationSourceAttr(UsdShade.Tokens.sourceAsset)
+    shader.SetSourceAsset(Sdf.AssetPath(APRILTAG_MDL), "mdl")
+    shader.SetSourceAssetSubIdentifier("AprilTag", "mdl")
+    shader.CreateInput("tag_id", Sdf.ValueTypeNames.Int).Set(tag_id)
+    shader.CreateInput("tag_mosaic", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(mosaic_path))
+    shader.CreateInput("tag_size", Sdf.ValueTypeNames.Int).Set(10)
+    shader.CreateInput("tags_per_row", Sdf.ValueTypeNames.Int).Set(24)
+    shader.CreateInput("spacing", Sdf.ValueTypeNames.Int).Set(1)
+    shader.CreateOutput("out", Sdf.ValueTypeNames.Token)
+    material.CreateSurfaceOutput("mdl").ConnectToSource(shader.ConnectableAPI(), "out")
+    material.CreateDisplacementOutput("mdl").ConnectToSource(shader.ConnectableAPI(), "out")
+    material.CreateVolumeOutput("mdl").ConnectToSource(shader.ConnectableAPI(), "out")
+    UsdShade.MaterialBindingAPI.Apply(tag_mesh.GetPrim()).Bind(material)
+    return tag_xform.GetPrim()
+
+
 def create_arena_usd(output_path: str, arena_size: float = 5.0):
     """Create a 5x5 arena USD file with walls, ArUco tags, and obstacle spawn points."""
 
@@ -75,27 +120,55 @@ def create_arena_usd(output_path: str, arena_size: float = 5.0):
     apriltag_usd_path = "assets/april_tags.usd"  # Adjust filename as needed
     tags_xform.GetPrim().GetReferences().AddReference(apriltag_usd_path)
 
+    # Keep the asset self-contained and compatible with the installed Isaac Sim
+    # version by overriding the bundled materials to use the checked-in MDL.
+    for tag_id in range(14):
+        shader = UsdShade.Shader.Get(stage, f"/World/arena/tags/Looks/AprilTag_{tag_id:02d}/Shader")
+        shader.SetSourceAsset(Sdf.AssetPath("assets/textures/AprilTag.mdl"), "mdl")
+
     # Define tag positions and transformations
     arena_half_size = arena_size / 2
+    # The referenced tag meshes are 100 units wide. A 0.002 scale therefore
+    # produces a 20 cm print (16 cm black square plus its white border).
     tag_size = 0.2 / 100
-    corner_offset = 1.25
+    tag_width = 0.2
+    tag_gap = 0.125  # 12.5 cm clear gap, within the requested 10--15 cm range.
+    tag_pitch = tag_width + tag_gap
     wall_offset = wall_thickness / 2
-    z_height = 0.3
+    z_height = 0.5
 
-    tag_transforms = [
-        # (tag_id, position, rotation)
-        (0, (arena_half_size - corner_offset, arena_half_size - wall_offset, z_height), (90, 0, 0)),  # top-right
-        (1, (-arena_half_size + corner_offset, arena_half_size - wall_offset, z_height), (90, 0, 0)),  # top-left
-        (2, (-arena_half_size + wall_offset, arena_half_size - corner_offset, z_height), (0, 90, 90)),  # left-top
-        (3, (-arena_half_size + wall_offset, -arena_half_size + corner_offset, z_height), (0, 90, 90)),  # left-bottom
-        (4, (arena_half_size - wall_offset, +arena_half_size - corner_offset, z_height), (0, -90, -90)),  # right-top
-        (5, (arena_half_size - wall_offset, -arena_half_size + corner_offset, z_height), (0, -90, -90)),  # right-bottom
-        (6, (arena_half_size - corner_offset, -arena_half_size + wall_offset, z_height), (-90, 0, 180)),  # bottom-right
-        (7, (-arena_half_size + corner_offset, -arena_half_size + wall_offset, z_height), (-90, 0, 180)),  # bottom-left
-    ]
+    def centered_offsets(count: int) -> list[float]:
+        """Return evenly pitched offsets whose group is centered on a wall."""
+        return [(index - (count - 1) / 2) * tag_pitch for index in range(count)]
 
-    # List of all possible tag IDs (0-13)
-    all_tag_ids = list(range(14))  # Adjust range based on your USD file
+    # Fill every wall with 15 unique tags at a 12.5 cm edge-to-edge gap.
+    tag_transforms = []
+    next_tag_id = 0
+    tags_per_wall = 15
+    for wall_name, count, rotation in (
+        ("front", tags_per_wall, (90, 0, 0)),
+        ("left", tags_per_wall, (0, 90, 90)),
+        ("right", tags_per_wall, (0, -90, -90)),
+        ("back", tags_per_wall, (-90, 0, 180)),
+    ):
+        for offset in centered_offsets(count):
+            if wall_name == "front":
+                position = (offset, arena_half_size - wall_offset, z_height)
+            elif wall_name == "back":
+                position = (offset, -arena_half_size + wall_offset, z_height)
+            elif wall_name == "left":
+                position = (-arena_half_size + wall_offset, offset, z_height)
+            else:
+                position = (arena_half_size - wall_offset, offset, z_height)
+            tag_transforms.append((next_tag_id, position, rotation))
+            next_tag_id += 1
+
+    # The referenced asset supplies IDs 0--13. Define the remaining unique
+    # tag36h11 IDs locally; the AprilTag MDL selects each code from the mosaic.
+    bundled_tag_count = 14
+    all_tag_ids = list(range(len(tag_transforms)))
+    for tag_id in all_tag_ids[bundled_tag_count:]:
+        define_apriltag(stage, tag_id, "assets/textures/tag36h11.png")
     active_tag_ids = [tag_id for tag_id, _, _ in tag_transforms]
     unused_tag_ids = [tag_id for tag_id in all_tag_ids if tag_id not in active_tag_ids]
 

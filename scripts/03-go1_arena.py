@@ -82,7 +82,7 @@ from go1_challenge.navigation import NavController
 from go1_challenge.isaaclab_tasks.go1_locomotion.go1_challenge_env_cfg import Go1ChallengeSceneCfg
 
 PKG_PATH = Path(__file__).parent.parent
-DEVICE = "cpu"
+DEVICE = "cuda:0"
 
 # Frequencies for navigation and localization updates
 # Main loop runs at 50 Hz
@@ -285,6 +285,7 @@ def main():
                 goal_pos = get_goal_position(env)
                 robot_pose = get_robot_position(env)
 
+                print("[DEBUG] Robot pose: ", robot_pose)
                 # Add goal and robot positions to observations
                 nav_observations = {
                     **obs_dict,
