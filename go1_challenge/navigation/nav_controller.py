@@ -1,8 +1,8 @@
-"""Monocular, AprilTag-guided exploration controller for the Go1 robot.
+"""AprilTag-guided exploration controller for the Go1 robot.
 
 The controller builds a sparse relative map rather than a dense occupancy map.
 The robot's startup pose defines map pose (0, 0, 0).  Known-size AprilTags add
-metric landmarks and correct monocular odometry drift when they are revisited.
+metric landmarks and provide the primary odometry whenever they are revisited.
 """
 
 import json
@@ -19,8 +19,8 @@ from pyapriltags import Detector
 # Change this default, or pass goal_tag_id to NavController, for the arena.
 DEFAULT_GOAL_TAG_ID = 0
 
-# Fill this when IDs encode semantics, for example {1: "wall", 8: "obstacle"}.
-# Any unlisted, non-goal tag is conservatively treated as a generic obstacle.
+# Optional per-tag overrides.  By default, non-goal IDs below 20 are walls,
+# IDs above 20 are obstacles, and ID 20 is generic.
 DEFAULT_TAG_TYPES: dict[int, str] = {}
 
 # OpenCV camera axes (right, down, forward) expressed in Go1 body axes
@@ -86,7 +86,6 @@ class NavController:
         self.pose_covariance = np.diag([self.pose_variance, self.pose_variance, self.yaw_variance])
         self.position_process_variance = 0.04
         self.yaw_process_variance = 0.12
-        self.vo_yaw_weight = 0.25
         self.command_speed_scale = 1.0
 
         # Camera origin relative to the base in body axes (meters).
@@ -95,19 +94,20 @@ class NavController:
         self.gravity_filter_gain = 0.20
         self.latest_yaw_rate = 0.0
         self.latest_velocity_command = np.zeros(3, dtype=np.float64)
-        self.previous_gray = None
+        self.has_previous_frame = False
         self.last_sensor_timestamp = None
         self.camera_frame_dt = 0.1
+        self.last_pose_source = "initial"
 
         # Sparse tag map.  Each tag stores a full map-frame pose, uncertainty,
         # observation count, and semantic type.
         self.landmark_map: dict[int, dict[str, Any]] = {}
         self.visible_tags: dict[int, dict[str, Any]] = {}
         self.minimum_tag_confidence = 15.0
-        self.landmark_maturity_observations = 3
         self.maximum_tag_position_innovation = 0.45
-        self.maximum_pose_position_correction = 0.10
-        self.maximum_pose_yaw_correction = np.radians(4.0)
+        self.maximum_tag_yaw_disagreement = np.radians(20.0)
+        self.tag_position_gain = 0.90
+        self.tag_yaw_gain = 0.85
         self.tag_map_update_count = 0
 
         # Goal-tag tracking.  Direct camera-relative control is used while the
@@ -259,94 +259,10 @@ class NavController:
         )
         return position_world_camera, rotation_world_from_camera
 
-    def _estimate_monocular_odometry(
-        self, previous_gray: np.ndarray, gray: np.ndarray, dt: float
-    ) -> tuple[np.ndarray, float, bool]:
-        """Estimate planar VO; commanded speed supplies monocular scale."""
-        features = cv2.goodFeaturesToTrack(
-            previous_gray,
-            maxCorners=500,
-            qualityLevel=0.01,
-            minDistance=8,
-            blockSize=7,
-        )
-        if features is None or len(features) < 8:
-            return np.zeros(2), 0.0, False
-        tracked, status, _ = cv2.calcOpticalFlowPyrLK(
-            previous_gray,
-            gray,
-            features,
-            None,
-            winSize=(21, 21),
-            maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-        )
-        if tracked is None or status is None:
-            return np.zeros(2), 0.0, False
-        valid = status.reshape(-1).astype(bool)
-        previous_pixels = features.reshape(-1, 2)[valid]
-        current_pixels = tracked.reshape(-1, 2)[valid]
-        if len(previous_pixels) < 8:
-            return np.zeros(2), 0.0, False
-
-        fx, fy, cx, cy = self.camera_params
-        intrinsic = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
-        try:
-            essential, mask = cv2.findEssentialMat(
-                previous_pixels,
-                current_pixels,
-                intrinsic,
-                method=cv2.RANSAC,
-                prob=0.999,
-                threshold=1.5,
-            )
-            if essential is None:
-                return np.zeros(2), 0.0, False
-            inliers, rotation_current_from_previous, translation, _ = cv2.recoverPose(
-                essential,
-                previous_pixels,
-                current_pixels,
-                intrinsic,
-                mask=mask,
-            )
-            if inliers < 8:
-                return np.zeros(2), 0.0, False
-        except cv2.error:
-            return np.zeros(2), 0.0, False
-
-        rotation_previous_from_current = rotation_current_from_previous.T
-        camera_delta = -rotation_previous_from_current @ translation.reshape(3)
-        forward_axis = rotation_previous_from_current[:, 2]
-        delta_yaw = _wrap_angle(np.arctan2(-forward_axis[0], forward_axis[2]))
-        metric_distance = self.command_speed_scale * np.linalg.norm(self.latest_velocity_command[:2]) * dt
-        if metric_distance < 1.0e-3:
-            return np.zeros(2), delta_yaw, True
-        camera_delta *= metric_distance
-        delta_body = np.array([camera_delta[2], -camera_delta[0]], dtype=np.float64)
-
-        # Remove apparent translation caused by the camera's forward lever arm
-        # when the base rotates in place.
-        offset = self.camera_offset_body[:2]
-        rotation_2d = np.array(
-            [[np.cos(delta_yaw), -np.sin(delta_yaw)], [np.sin(delta_yaw), np.cos(delta_yaw)]]
-        )
-        delta_body -= rotation_2d @ offset - offset
-        if abs(delta_yaw) > 0.8 or np.linalg.norm(delta_body) > max(0.35, 3.0 * dt):
-            return np.zeros(2), 0.0, False
-        return delta_body, delta_yaw, True
-
-    def _predict_pose(self, gray: np.ndarray, dt: float) -> None:
-        """Propagate pose with monocular VO, command scale, and IMU yaw."""
-        imu_delta_yaw = self.latest_yaw_rate * dt
+    def _predict_pose_without_tags(self, dt: float) -> None:
+        """Bridge tag sightings using commanded translation and IMU yaw."""
         delta_body = self.latest_velocity_command[:2] * self.command_speed_scale * dt
-        delta_yaw = imu_delta_yaw
-        if self.previous_gray is not None:
-            vo_translation, vo_delta_yaw, vo_valid = self._estimate_monocular_odometry(
-                self.previous_gray, gray, dt
-            )
-            if vo_valid:
-                delta_body = vo_translation
-                delta_yaw = self.vo_yaw_weight * vo_delta_yaw + (1.0 - self.vo_yaw_weight) * imu_delta_yaw
+        delta_yaw = self.latest_yaw_rate * dt
 
         previous_yaw = float(self.robot_pose[2])
         cosine, sine = np.cos(previous_yaw), np.sin(previous_yaw)
@@ -356,6 +272,7 @@ class NavController:
         self.pose_variance += self.position_process_variance * dt
         self.yaw_variance += self.yaw_process_variance * dt
         self.pose_covariance = np.diag([self.pose_variance, self.pose_variance, self.yaw_variance])
+        self.last_pose_source = "imu_command"
 
     # ------------------------------------------------------------------
     # Sparse AprilTag SLAM
@@ -386,28 +303,49 @@ class NavController:
         position_world_body = position_world_camera - rotation_world_from_body @ self.camera_offset_body
         return np.array([position_world_body[0], position_world_body[1], yaw], dtype=np.float64)
 
-    def _correct_pose_from_known_landmarks(self, detections: dict[int, dict]) -> None:
+    def _correct_pose_from_known_landmarks(self, detections: dict[int, dict]) -> bool:
+        """Use reobserved tags as the primary robot-pose measurement."""
         measurements = []
         weights = []
         for tag_id, tag_info in detections.items():
             landmark = self.landmark_map.get(tag_id)
-            if landmark is None or landmark["observations"] < self.landmark_maturity_observations:
+            if landmark is None or float(tag_info.get("confidence", 0.0)) < self.minimum_tag_confidence:
                 continue
             confidence = float(tag_info["confidence"])
             distance = float(tag_info["distance"])
             measurement = self._robot_measurement_from_landmark(landmark, tag_info)
-            innovation = measurement - self.robot_pose
-            innovation[2] = _wrap_angle(innovation[2])
-            if np.linalg.norm(innovation[:2]) > self.maximum_tag_position_innovation:
+            if not np.all(np.isfinite(measurement)):
                 continue
             variance = max(1.0e-4, (0.03 + 0.025 * distance * distance) ** 2)
             measurements.append(measurement)
-            weights.append(confidence / variance)
+            weights.append(confidence / (variance + float(landmark["variance"])))
 
         if not measurements:
-            return
+            return False
         poses = np.asarray(measurements)
         weights_array = np.asarray(weights)
+
+        # Reject a bad PnP solution or a poorly initialized landmark by using
+        # the candidate pose with the strongest nearby consensus as reference.
+        consensus_scores = []
+        for candidate in poses:
+            position_close = np.linalg.norm(poses[:, :2] - candidate[:2], axis=1) <= (
+                self.maximum_tag_position_innovation
+            )
+            yaw_close = np.abs(
+                np.array([_wrap_angle(yaw - candidate[2]) for yaw in poses[:, 2]])
+            ) <= self.maximum_tag_yaw_disagreement
+            consensus_scores.append(float(np.sum(weights_array[position_close & yaw_close])))
+        reference = poses[int(np.argmax(consensus_scores))]
+        accepted = (
+            np.linalg.norm(poses[:, :2] - reference[:2], axis=1)
+            <= self.maximum_tag_position_innovation
+        ) & (
+            np.abs(np.array([_wrap_angle(yaw - reference[2]) for yaw in poses[:, 2]]))
+            <= self.maximum_tag_yaw_disagreement
+        )
+        poses = poses[accepted]
+        weights_array = weights_array[accepted]
         weight_sum = float(np.sum(weights_array))
         measured_pose = np.empty(3, dtype=np.float64)
         measured_pose[:2] = np.sum(poses[:, :2] * weights_array[:, None], axis=0) / weight_sum
@@ -416,33 +354,20 @@ class NavController:
             np.sum(weights_array * np.cos(poses[:, 2])),
         )
 
-        position_correction = 0.25 * (measured_pose[:2] - self.robot_pose[:2])
-        correction_norm = float(np.linalg.norm(position_correction))
-        if correction_norm > self.maximum_pose_position_correction:
-            position_correction *= self.maximum_pose_position_correction / correction_norm
-        yaw_correction = np.clip(
-            0.25 * _wrap_angle(measured_pose[2] - self.robot_pose[2]),
-            -self.maximum_pose_yaw_correction,
-            self.maximum_pose_yaw_correction,
+        self.robot_pose[:2] += self.tag_position_gain * (measured_pose[:2] - self.robot_pose[:2])
+        self.robot_pose[2] = _wrap_angle(
+            self.robot_pose[2]
+            + self.tag_yaw_gain * _wrap_angle(measured_pose[2] - self.robot_pose[2])
         )
-        self.robot_pose[:2] += position_correction
-        self.robot_pose[2] = _wrap_angle(self.robot_pose[2] + yaw_correction)
-        self.pose_variance *= 0.80
-        self.yaw_variance *= 0.80
+        measurement_variance = max(1.0e-4, 1.0 / weight_sum)
+        self.pose_variance = measurement_variance
+        self.yaw_variance = max(measurement_variance, np.radians(1.5) ** 2)
         self.pose_covariance = np.diag([self.pose_variance, self.pose_variance, self.yaw_variance])
-
-    @staticmethod
-    def _average_rotations(first: np.ndarray, second: np.ndarray, second_weight: float) -> np.ndarray:
-        matrix = (1.0 - second_weight) * first + second_weight * second
-        left, _, right = np.linalg.svd(matrix)
-        rotation = left @ right
-        if np.linalg.det(rotation) < 0.0:
-            left[:, -1] *= -1.0
-            rotation = left @ right
-        return rotation
+        self.last_pose_source = "apriltag"
+        return True
 
     def _update_landmark_map(self, detections: dict[int, dict]) -> None:
-        """Initialize new landmarks and gently refine immature landmarks."""
+        """Register new tag anchors and count their later observations."""
         new_tag_seen = False
         for tag_id, tag_info in detections.items():
             confidence = float(tag_info.get("confidence", 0.0))
@@ -462,20 +387,15 @@ class NavController:
                     "rotation_matrix": rotation,
                     "variance": variance,
                     "observations": 1,
-                    "kind": self.tag_types.get(tag_id, "generic"),
+                    "kind": self._tag_kind(tag_id),
                 }
             else:
                 residual = position - landmark["position"]
                 if np.linalg.norm(residual[:2]) > self.maximum_tag_position_innovation:
                     continue
                 count = int(landmark["observations"])
-                # Freeze mature landmarks as loop-closure anchors.  Early
-                # observations are averaged to reduce single-frame PnP noise.
-                gain = 1.0 / (count + 1.0) if count < self.landmark_maturity_observations else 0.01
-                landmark["position"] = (1.0 - gain) * landmark["position"] + gain * position
-                landmark["rotation_matrix"] = self._average_rotations(
-                    landmark["rotation_matrix"], rotation, gain
-                )
+                # Keep the world pose fixed: moving an anchor with the same
+                # measurement used to localize the robot would reintroduce drift.
                 landmark["variance"] = min(float(landmark["variance"]), variance)
                 landmark["observations"] = count + 1
 
@@ -496,7 +416,15 @@ class NavController:
     # Gap exploration and goal approach
     # ------------------------------------------------------------------
     def _tag_kind(self, tag_id: int) -> str:
-        return self.tag_types.get(tag_id, "generic")
+        if tag_id == self.goal_tag_id:
+            return "goal"
+        if tag_id in self.tag_types:
+            return self.tag_types[tag_id]
+        if tag_id < 20:
+            return "wall"
+        if tag_id > 20:
+            return "obstacle"
+        return "generic"
 
     def _tag_safety_radius(self, tag_id: int) -> float:
         kind = self._tag_kind(tag_id)
@@ -723,17 +651,15 @@ class NavController:
         if image.dtype != np.uint8:
             scale = 255.0 if image.size and image.max() <= 1.0 else 1.0
             image = np.clip(image * scale, 0, 255).astype(np.uint8)
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
-
         sensor_timestamp = observations.get("timestamp")
-        if self.previous_gray is None:
+        if not self.has_previous_frame:
             dt = 0.0
         elif sensor_timestamp is not None and self.last_sensor_timestamp is not None:
             dt = float(np.clip(float(sensor_timestamp) - self.last_sensor_timestamp, 1.0e-3, 0.5))
         else:
             dt = self.camera_frame_dt
         if dt > 0.0:
-            self._predict_pose(gray, dt)
+            self._predict_pose_without_tags(dt)
 
         detections = self.detect_apriltags(image)
         self._correct_pose_from_known_landmarks(detections)
@@ -762,13 +688,14 @@ class NavController:
             self.path.append(self.robot_pose[:2].copy().tolist())
             self.path = self.path[-1000:]
 
-        self.previous_gray = gray.copy()
+        self.has_previous_frame = True
         self.last_sensor_timestamp = None if sensor_timestamp is None else float(sensor_timestamp)
         print(
             "[NavController] Pose "
             f"x={self.robot_pose[0]:.3f}, y={self.robot_pose[1]:.3f}, "
             f"yaw={np.degrees(self.robot_pose[2]):.1f} deg; "
-            f"tags={sorted(detections)}, goal_visible={goal is not None}"
+            f"source={self.last_pose_source}, tags={sorted(detections)}, "
+            f"goal_visible={goal is not None}"
         )
 
     def get_command(self) -> np.ndarray:
@@ -794,8 +721,9 @@ class NavController:
         self.projected_gravity[:] = (0.0, 0.0, -1.0)
         self.latest_yaw_rate = 0.0
         self.latest_velocity_command.fill(0.0)
-        self.previous_gray = None
+        self.has_previous_frame = False
         self.last_sensor_timestamp = None
+        self.last_pose_source = "initial"
         self.landmark_map.clear()
         self.visible_tags.clear()
         self.goal_relative_body = None
@@ -831,6 +759,7 @@ class NavController:
         return {
             "robot_pose": self.robot_pose.tolist(),
             "pose_covariance": self.pose_covariance.tolist(),
+            "pose_source": self.last_pose_source,
             "state": self.state,
             "goal_tag_id": self.goal_tag_id,
             "goal_visible": self.goal_relative_body is not None,
