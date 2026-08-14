@@ -25,13 +25,19 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, CameraCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg, TerrainGeneratorCfg
 
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
 
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.noise import UniformNoiseCfg as Unoise
 
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
+from .mdp.commands import PureTurnUniformVelocityCommandCfg
+from .mdp.rewards import feet_air_time as feet_air_time_reward
+from .mdp.rewards import feet_lift as feet_lift_reward
 from .mdp.rewards import finite_base_height_l2
+from .mdp.rewards import prolonged_foot_contact as prolonged_foot_contact_reward
+from .mdp.rewards import stand_still_joint_deviation_l1 as stand_still_joint_deviation_l1_reward
+from .mdp.rewards import velocity_conditioned_feet_air_time as velocity_conditioned_feet_air_time_reward
 
 ##
 # Pre-defined configs
@@ -163,7 +169,7 @@ class LocoSceneCfg(InteractiveSceneCfg):
 class CommandsCfg:
     """Command specifications for the MDP."""
 
-    base_velocity = mdp.UniformVelocityCommandCfg(
+    base_velocity = PureTurnUniformVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
         rel_standing_envs=0.02,
@@ -171,7 +177,7 @@ class CommandsCfg:
         heading_command=True,
         heading_control_stiffness=0.5,
         debug_vis=True,
-        ranges=mdp.UniformVelocityCommandCfg.Ranges(
+        ranges=PureTurnUniformVelocityCommandCfg.Ranges(
             lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
         ),
     )
@@ -344,7 +350,12 @@ class RewardsCfg:
     base_height_l2 = RewTerm(
         func=finite_base_height_l2,
         weight=-5.0,
-        params={"target_height": 0.4, "sensor_cfg": SceneEntityCfg("height_scanner"), "max_height_error": 1.0},
+        params={
+            "target_height": 0.4,
+            "height_tolerance": 0.02,
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+            "max_height_error": 1.0,
+        },
     )
 
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
@@ -352,13 +363,76 @@ class RewardsCfg:
     dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0002)
     dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    fall_penalty = RewTerm(
+        func=mdp.is_terminated_term,
+        weight=-200.0,
+        params={"term_keys": "base_contact"},
+    )
+    stand_still_joint_deviation_l1 = RewTerm(
+        func=stand_still_joint_deviation_l1_reward,
+        weight=0.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "command_name": "base_velocity",
+            "command_threshold": 0.1,
+        },
+    )
     feet_air_time = RewTerm(
-        func=mdp.feet_air_time,
+        func=feet_air_time_reward,
         weight=0.125,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
             "command_name": "base_velocity",
             "threshold": 0.01,
+        },
+    )
+    velocity_conditioned_feet_air_time = RewTerm(
+        func=velocity_conditioned_feet_air_time_reward,
+        weight=0.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+            "command_name": "base_velocity",
+            "min_air_time": 0.16,
+            "max_air_time": 0.30,
+            "velocity_gain": 0.10,
+            "yaw_scale": 0.25,
+            "std": 0.06,
+            "command_threshold": 0.1,
+        },
+    )
+    feet_slide = RewTerm(
+        func=mdp.feet_slide,
+        weight=-0.1,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+        },
+    )
+    prolonged_foot_contact = RewTerm(
+        func=prolonged_foot_contact_reward,
+        weight=0.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+            "command_name": "base_velocity",
+            "min_stance_time": 0.22,
+            "max_stance_time": 0.45,
+            "velocity_gain": 0.15,
+            "yaw_scale": 0.25,
+            "excess_time_scale": 0.30,
+            "max_normalized_excess": 4.0,
+            "max_linear_speed": 0.1,
+            "command_threshold": 0.1,
+        },
+    )
+    feet_lift = RewTerm(
+        func=feet_lift_reward,
+        weight=0.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "command_name": "base_velocity",
+            "target_height": 0.075,
+            "std": 0.03,
+            "tanh_mult": 2.0,
         },
     )
     # undesired_contacts = RewTerm(

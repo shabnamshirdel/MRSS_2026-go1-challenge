@@ -4,6 +4,8 @@ headless: true  # Run simulation without rendering a GUI (faster, better for tra
 max_iterations: 700  # Adjust this to train for longer: 1.5k should give you a working policy for rough terrain
 penalize_target_height: true  # Enable terrain-relative trunk-height penalization
 randomize_actuator_response: false  # Randomize motor strength and response delay when enabled
+use_velocity_conditioned_feet_air_time: false  # true: target swing time; false: original air-time reward
+use_prolonged_foot_contact_instead_of_feet_slide: false  # true: stance timeout; false: sliding penalty
 
 seed: 1 # Performance should be somewhat consistent across seeds
 
@@ -19,6 +21,10 @@ resume: false  # Whether to resume from a checkpoint.
 logger: wandb  # Logger module to use. {neptune, wandb, tensorboard}
 log_project_name: MRSS26  # Name of the logging project when using wandb or neptune.
 env:
+  commands:
+    base_velocity:
+      rel_pure_turn_envs: 0.25  # Fraction of commands with vx=vy=0 for in-place-turn practice
+
   scene:
     num_envs: 1024  # Number of environments to generate terrain for and run in parallel.
 
@@ -71,6 +77,8 @@ env:
   rewards:
     action_rate_l2:
       weight: -0.01  # Penalty for rapid changes in actions (encourages smoothness)
+    fall_penalty:
+      weight: -200.0  # One-time -4 return on trunk-contact fall at the 0.02 s control step
     ang_vel_xy_l2:
       # weight: -0.01  # Penalize angular velocity in x and y directions (helps stability)
       weight: -0.025
@@ -79,6 +87,7 @@ env:
       weight: -50.0
       params:
         target_height: 0.3  # Desired trunk height above the local terrain in meters
+        height_tolerance: 0.02  # No height penalty within +/-2 cm of the target
     dof_acc_l2:
       # weight: -2.5e-06  # Penalty for joint accelerations (encourages smoother motion)
       weight: -5.0e-07
@@ -93,6 +102,28 @@ env:
       # weight: 0.01  # Reward for time feet spend in the air (encourages stepping/gait)
       # weight: 0.125
       weight: 0.7
+    velocity_conditioned_feet_air_time:
+      weight: 0.1
+      params:
+        min_air_time: 0.16  # Fast-gait target floor (s)
+        max_air_time: 0.30  # Slow-gait target ceiling (s)
+        velocity_gain: 0.10  # Target-time reduction per equivalent m/s
+        yaw_scale: 0.25  # Convert yaw rate to approximate tangential foot speed (m)
+        std: 0.06  # Gaussian target-time tolerance (s)
+        command_threshold: 0.1  # Disable for near-zero full velocity commands
+    feet_slide:
+      weight: -0.1  # Penalize horizontal foot velocity while the foot is in contact
+    prolonged_foot_contact:
+      weight: -0.2
+      params:
+        min_stance_time: 0.22  # Allowed stance time at high command speeds (s)
+        max_stance_time: 0.45  # Allowed stance time at low command speeds (s)
+        velocity_gain: 0.15  # Target stance-time reduction per equivalent m/s
+        yaw_scale: 0.25  # Convert yaw rate to approximate tangential foot speed (m)
+        excess_time_scale: 0.30  # Seconds of excess contact corresponding to normalized excess 1
+        max_normalized_excess: 4.0  # Bound outliers while making a persistent anchor increasingly costly
+        max_linear_speed: 0.1  # Apply only to yaw-only commands; preserve translational gaits
+        command_threshold: 0.1  # Disable for near-zero full velocity commands
     flat_orientation_l2:
       # weight: 0.0  # Penalty for orientation deviation from flat (disabled here)
       # weight: 0.01
@@ -102,7 +133,7 @@ env:
       # weight: -1.0
       weight: -2.0
     track_ang_vel_z_exp:
-      weight: 2.0  # Reward for matching desired angular velocity around z-axis (yaw control)
+      weight: 2.5  # Give in-place yaw tracking enough influence relative to linear tracking
     track_lin_vel_xy_exp:
       # weight: 1.5  # Reward for matching desired linear velocity in x-y plane
       weight: 3.5

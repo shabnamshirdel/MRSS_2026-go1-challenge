@@ -4,30 +4,21 @@ headless: true  # Run simulation without rendering a GUI (faster, better for tra
 max_iterations: 1500  # Adjust this to train for longer: 1.5k should give you a working policy for rough terrain
 penalize_target_height: true # Set false to remove the base-height deviation penalty during training
 randomize_actuator_response: false # Randomize motor strength by +/-10% and response smoothing by 0-10%
-use_velocity_conditioned_feet_air_time: false # true: target swing time; false: original air-time reward
-use_prolonged_foot_contact_instead_of_feet_slide: false # Disable failed contact-duration experiment
-# Reproduce the strongest 2026-08-13_18-00-34 context with equal linear/yaw
-# tracking and explicit pure-turn samples; contact-duration penalties are disabled.
-seed: 68775 # Experiment seed
+
+seed: 1003 # Performance should be somewhat consistent across seeds
 
 video: false  # Record videos during training.
 video_length: 10  # Length of the recorded video (in steps).
 video_interval: 10  # Interval between video recordings (in steps).
 
-run_name: reference_context_equal_yaw_pure_turn_no_contact_penalty  # Run name suffix to the log directory.
-experiment_name: go1_locomotion_reference_context_pure_turn  # Keep this ablation separate from prior runs.
+run_name: uneven_better_rewards  # Run name suffix to the log directory.
+experiment_name: go1_locomotion_height_training  # Folder under logs/rsl_rl used for checkpoints.
 resume: false  # Whether to resume from a checkpoint.
 #load_run: LOAD_RUN   # Name of the run folder to resume from.
 #checkpoint: CHECKPOINT  # Checkpoint file to resume from.
 logger: wandb  # Logger module to use. {neptune, wandb, tensorboard}
 log_project_name: MRSS26  # Name of the logging project when using wandb or neptune.
 env:
-  commands:
-    base_velocity:
-      # The reference run had effectively no exact yaw-only samples. Ten percent
-      # adds focused practice without displacing as much walking data as 25% did.
-      rel_pure_turn_envs: 0.10
-
   scene:
     num_envs: 1024 #Number of environments to generate terrain for and run in parallel.
 
@@ -60,15 +51,15 @@ env:
           # pyramid_slope_inv:
           #   proportion: 0.1
           flat:
-            proportion: 0.7
+            proportion: 0.6
           pyramid_stairs:
             proportion: 0.0
           pyramid_stairs_inv:
             proportion: 0.0
           boxes:
-            proportion: 0.15
+            proportion: 0.2
           random_rough:
-            proportion: 0.15
+            proportion: 0.2
           pyramid_slope:
             proportion: 0.0
           pyramid_slope_inv:
@@ -88,17 +79,14 @@ env:
   rewards:
     action_rate_l2:
       weight: -0.01  # Penalty for rapid changes in actions (encourages smoothness)
-    fall_penalty:
-      weight: 0.0  # Absent from the reference run; trunk contact still terminates the episode
     ang_vel_xy_l2:
       # weight: -0.01  # Penalize angular velocity in x and y directions (helps stability)
-      weight: -0.035
+      weight: -0.07
     base_height_l2: 
       # weight: -5.0  # Penalize squared deviation from the desired terrain-relative trunk height
       weight: -50.0
       params:
-        target_height: 0.3  # Desired trunk height above the local terrain in meters
-        height_tolerance: 0.0  # Reference run penalized all deviation from 0.30 m
+        target_height: 0.28  # Desired trunk height above the local terrain in meters
     dof_acc_l2:
       # weight: -2.5e-06  # Penalty for joint accelerations (encourages smoother motion)
       weight: -5.0e-07
@@ -109,54 +97,23 @@ env:
       # weight: -0.0002  # Penalty for large joint torques (encourages energy efficiency)
       # weight: -0.001
       weight: -0.0005
-    stand_still_joint_deviation_l1:
-      weight: 0.0  # Absent from the reference run
-      params:
-        command_threshold: 0.1
     feet_air_time:
       # weight: 0.01  # Reward for time feet spend in the air (encourages stepping/gait)
       # weight: 0.125
-      weight: 0.5
-    velocity_conditioned_feet_air_time:
-      weight: 0.0
-      params:
-        min_air_time: 0.16  # Fast-gait target floor (s)
-        max_air_time: 0.30  # Slow-gait target ceiling (s)
-        velocity_gain: 0.10  # Target-time reduction per equivalent m/s
-        yaw_scale: 0.25  # Convert yaw rate to approximate tangential foot speed (m)
-        std: 0.06  # Gaussian target-time tolerance (s)
-        command_threshold: 0.1  # Disable for near-zero full velocity commands
-    feet_slide:
-      weight: 0.0  # Absent from the reference run; avoid opposing pivot motion
-    prolonged_foot_contact:
-      weight: 0.0
-      params:
-        min_stance_time: 0.22  # Allowed stance time at high command speeds (s)
-        max_stance_time: 0.45  # Allowed stance time at low command speeds (s)
-        velocity_gain: 0.15  # Target stance-time reduction per equivalent m/s
-        yaw_scale: 0.25  # Convert yaw rate to approximate tangential foot speed (m)
-        excess_time_scale: 0.30  # Seconds of excess contact corresponding to normalized excess 1
-        max_normalized_excess: 4.0  # Bound outliers while making a persistent anchor increasingly costly
-        max_linear_speed: 0.1  # Apply only to yaw-only commands; preserve translational gaits
-        command_threshold: 0.1  # Disable for near-zero full velocity commands
-    feet_lift:
-      weight: 0.0  # Absent from the reference run
-      params:
-        target_height: 0.075  # Desired vertical lift above the nominal stance (m)
-        std: 0.03  # Width of the bounded Gaussian height target (m)
-        tanh_mult: 2.0  # Saturation rate for the horizontal foot-speed gate
+      weight: 0.2
     flat_orientation_l2:
       # weight: 0.0  # Penalty for orientation deviation from flat (disabled here)
       # weight: 0.01
-      weight: -0.05
+      weight: -0.07
     lin_vel_z_l2:
       # weight: -2.0  # Penalty for vertical (z-axis) linear velocity (encourages flat motion)
+      # weight: -1.0
       weight: -2.0
     track_ang_vel_z_exp:
-      weight: 2.5  # Match the reference runs XY tracking weight
+      weight: 1.5  # Reward for matching desired angular velocity around z-axis (yaw control)
     track_lin_vel_xy_exp:
       # weight: 1.5  # Reward for matching desired linear velocity in x-y plane
-      weight: 2.5
+      weight: 3.5
 
   events:
     add_base_mass:
